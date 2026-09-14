@@ -10,7 +10,7 @@ reconstruction. This captures the source, continuously, so you build a real
 history instead of a snapshot.
 
 It also sniffs per-request model and token counts out of the response stream,
-which gives you the same numbers `sched.py` derived from transcripts, without
+which gives you the same numbers a transcript parser would derive, without
 the transcript-parsing caveats (no duplicate `message.id` rows, no
 `<synthetic>` entries, no missing requests).
 
@@ -204,7 +204,7 @@ have processed a request it never received.
 ## Provenance
 
 Grew out of a throwaway script in a Claude Code scratchpad
-(`ratelimit_proxy.py`, Sept 2026) written alongside `sched.py` / `roll.py` /
-`hourly-credits.py` while working out how Max 20x plan limits actually behave.
-Those answered "what did I spend"; this answers "what does Anthropic think I
-spent", which turned out to be the more useful question.
+(`ratelimit_proxy.py`, Sept 2026) written alongside a few other scripts while
+working out how Max 20x plan limits actually behave. Those answered "what did
+I spend"; this answers "what does Anthropic think I spent", which turned out
+to be the more useful question.
