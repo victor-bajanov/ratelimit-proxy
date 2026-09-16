@@ -677,7 +677,16 @@ class Upstream:
     #    path recover invisibly. Fresh connections keep the full timeout,
     #    since legitimate first-byte latency (large prompts, extended
     #    thinking) can be much longer than this.
+    #
+    #    That same latency argument applies to a *just-reused* connection too:
+    #    one handed back to the pool moments ago and pulled straight back out
+    #    hasn't been idle long enough for a NAT/LB to have silently reaped it
+    #    - a slow getresponse() on it is real upstream latency, not a dead
+    #    socket, so firing the fast timeout there only manufactures a
+    #    duplicate request. Only apply it once idle time makes a silent drop
+    #    plausible.
     STALE_READ_TIMEOUT = 15
+    STALE_CHECK_MIN_IDLE = 30
 
     def __init__(self, host: str, timeout: int, resolver: Resolver, size: int = 8):
         self.host, self.timeout, self.size = host, timeout, size
@@ -719,7 +728,8 @@ class Upstream:
                 error = exc
         raise error or OSError(f"no usable address for {host}")
 
-    def _take(self) -> http.client.HTTPSConnection:
+    def _take(self) -> tuple[http.client.HTTPSConnection, float]:
+        """Returns (conn, idle_age) — idle_age is 0.0 for a freshly dialed conn."""
         now = time.monotonic()
         with self.lock:
             while self.pool:
@@ -731,11 +741,11 @@ class Upstream:
                     self.stats["pool_dropped"] += 1
                     _close(conn)
                     continue
-                return conn
+                return conn, now - idle_since
         conn = http.client.HTTPSConnection(self.host, timeout=self.timeout,
                                            context=self.ctx)
         conn._create_connection = self._dial  # type: ignore[method-assign]
-        return conn
+        return conn, 0.0
 
     def give_back(self, conn):
         with self.lock:
@@ -751,26 +761,62 @@ class Upstream:
         processed the request, so replaying it is safe.
         """
         error = None
-        for _ in range(2):
-            conn = self._take()
+        for attempt in range(2):
+            conn, idle_age = self._take()
             reused = conn.sock is not None
+            fast_check = reused and idle_age >= self.STALE_CHECK_MIN_IDLE
+            stalled_at = time.monotonic()
             try:
                 conn.request(method, path, body=body, headers=headers)
-                if reused:
+                if fast_check:
                     conn.sock.settimeout(self.STALE_READ_TIMEOUT)
                 try:
                     response = conn.getresponse()
-                except (TimeoutError, OSError):
-                    if reused:
+                except (TimeoutError, OSError) as exc:
+                    if fast_check:
                         self.stats["pool_stale_timeout"] += 1
+                        self._log_stale(method, path, body, idle_age,
+                                        time.monotonic() - stalled_at, attempt, exc)
                     raise
-                if reused:
+                if fast_check:
                     conn.sock.settimeout(self.timeout)
                 return conn, response
             except Exception as exc:
                 _close(conn)
                 error = exc
         raise error  # type: ignore[misc]
+
+    @staticmethod
+    def _is_streaming(body: bytes | None) -> str:
+        if not body:
+            return "?"
+        try:
+            payload = json.loads(body)
+            return str(bool(payload.get("stream"))) if isinstance(payload, dict) else "?"
+        except Exception:
+            return "?"
+
+    def _log_stale(self, method: str, path: str, body: bytes | None,
+                    idle_age: float, waited: float, attempt: int, exc: Exception):
+        """Diagnostic for the reused-connection fast-fail path.
+
+        idle_age is how long the connection sat in the pool before reuse (helps
+        tell "died while idle" apart from "died mid-request"); waited is how
+        long we actually blocked on this attempt before giving up. attempt==0
+        means send() will retry on a fresh connection next; attempt==1 means
+        that retry also failed and the caller is about to surface a 502 - if
+        that happens on a live, slow-to-respond upstream (streaming=False,
+        waited close to STALE_READ_TIMEOUT), this path likely just fired a
+        false positive and duplicated the request.
+        """
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        outcome = "retrying fresh" if attempt == 0 else "retry ALSO failed, giving up"
+        sys.stderr.write(
+            f"[{ts}] stale-timeout: {method} {path}  "
+            f"idle_age={idle_age:.1f}s waited={waited:.1f}s "
+            f"streaming={self._is_streaming(body)} "
+            f"error={type(exc).__name__}({exc}) -> {outcome}\n")
+        sys.stderr.flush()
 
 
 def _close(conn):
@@ -1265,9 +1311,8 @@ def status(args):
               f"{info['rows_written']} rows written, {info['rows_dropped']} dropped")
         pool_dropped = info.get("pool_dropped", 0)
         pool_stale = info.get("pool_stale_timeout", 0)
-        if pool_dropped or pool_stale:
-            print(f"pool    : {pool_dropped} dead pooled conns dropped, "
-                  f"{pool_stale} stale-timeout recoveries")
+        print(f"pool    : {pool_dropped} dead pooled conns dropped, "
+              f"{pool_stale} stale-timeout recoveries")
         if info.get("last_write_error"):
             print(f"          last write error: {info['last_write_error']}")
 
