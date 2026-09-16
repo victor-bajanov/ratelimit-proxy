@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS ratelimit (
     overage_status       TEXT,
     fallback_percentage  REAL,
     retry_after          INTEGER,
-    extra                TEXT
+    extra                TEXT,
+    request_id           TEXT
 );
 CREATE INDEX IF NOT EXISTS ratelimit_ts ON ratelimit(ts);
 
@@ -184,7 +185,10 @@ HEADER_COLUMNS = {
     "anthropic-ratelimit-unified-fallback-percentage": ("fallback_percentage", float),
     "retry-after": ("retry_after", int),
 }
-RATELIMIT_COLUMNS = ["ts"] + [c for c, _ in HEADER_COLUMNS.values()] + ["extra"]
+RATELIMIT_COLUMNS = (["ts"] + [c for c, _ in HEADER_COLUMNS.values()]
+                     + ["extra", "request_id"])
+# Columns added after the first release, applied to older databases on open.
+MIGRATIONS = {"ratelimit": {"request_id": "TEXT"}}
 
 # Columns whose change makes a sample worth storing. Everything else (a reset
 # timestamp ticking over, say) rides along on the next real change.
@@ -200,6 +204,12 @@ def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     else:
         conn = sqlite3.connect(path, timeout=30)
         conn.executescript(SCHEMA)
+        for table, columns in MIGRATIONS.items():
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for column, kind in columns.items():
+                if column not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+        conn.commit()
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
@@ -225,8 +235,9 @@ class Recorder:
     def start(self):
         self._thread.start()
 
-    def ratelimit(self, headers: dict[str, str]):
+    def ratelimit(self, headers: dict[str, str], request_id: str | None = None):
         row: dict = {c: None for c in RATELIMIT_COLUMNS}
+        row["request_id"] = request_id
         extra = {}
         for name, value in headers.items():
             key = name.lower()
@@ -239,7 +250,8 @@ class Recorder:
                 row[column] = cast(value)
             except (TypeError, ValueError):
                 extra[key] = value
-        if not any(row[c] is not None for c in RATELIMIT_COLUMNS if c != "ts"):
+        if not any(row[c] is not None for c in RATELIMIT_COLUMNS
+                   if c not in ("ts", "request_id")):
             return  # nothing but noise
         signal = tuple(row[c] for c in DEDUP_ON)
         if signal == self._last_signal:
@@ -980,11 +992,11 @@ class Proxy(BaseHTTPRequestHandler):
     def _record(self, response, sniffer: UsageSniffer, started: float):
         signal = {name: value for name, value in response.getheaders()
                   if KEEP.search(name) and not SECRET.search(name)}
+        request_id = response.getheader("request-id")
         if signal:
-            self.recorder.ratelimit(signal)
+            self.recorder.ratelimit(signal, request_id)
 
         sniffer.finish()
-        request_id = response.getheader("request-id")
         if sniffer.model or request_id:
             self.recorder.request({
                 "ts": int(time.time()),

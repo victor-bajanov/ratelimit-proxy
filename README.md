@@ -107,6 +107,42 @@ latest signal (Sat 12 Sep 13:58), status allowed_warning:
   7d        77.0%  [###############################.........]  resets Wed 16 Sep 01:00
 ```
 
+## Operational time: what does a token cost?
+
+```
+uv run optime.py                    # every meter: dataset summary + fit
+uv run optime.py --meter 5h --show  # print the per-tick interval table
+uv run optime.py --csv ticks.csv    # dump the dataset for your own analysis
+uv run optime.py --by-model         # one coefficient per (model, counter)
+```
+
+The meters are rounded to 1%, so calendar time is the wrong clock for
+relating tokens to utilisation. `optime.py` re-indexes the data on
+*operational time* -- one unit is one tick of the meter -- the way a claims
+development triangle is indexed on development period rather than the
+calendar. For each meter (5h, 7d, 7d-opus) it finds the boundary request that
+first carried each new level, aggregates every token counter between
+consecutive boundaries, and fits
+
+```
+ticks = b_in * input + b_out * output + b_cw * cache_write + b_cr * cache_read
+```
+
+with no intercept. Censored intervals are dropped: the first level seen in
+each window (start of the data, and the start of every window after a reset),
+the tail after the last boundary (end of data, and the run-up to a reset), and
+intervals with no recorded traffic (the tick was earned on another machine).
+Within a window the meter can only rise, so the first sighting of each new
+running-max level is the boundary; stale lower values from long-running
+concurrent responses are ignored.
+
+The script reads whatever the database holds and refits on all of it, so
+rerun it as the history grows. The proxy sees one machine while the meter
+counts the whole account, so absolute coefficients are biased upwards and the
+implied window cap is a floor; the ratios between counters are the robust
+output. A single-coefficient fit on `credits()` is printed alongside as a
+sanity check against the pricing table.
+
 ## What else this catches
 
 A hosts entry is machine-wide, so this is no longer just Claude Code's proxy.
@@ -134,7 +170,10 @@ proxy is running.
 
 **`ratelimit`** — one row per *change* in the signal, not per request. A busy
 hour where utilisation doesn't move produces one row, so the table stays small
-and every row is a real event. Known headers get typed columns; anything new
+and every row is a real event. Each row carries the `request_id` of the
+response that delivered it, so a signal change can be joined back to the
+request (and its start time) that observed it. Known headers get typed
+columns; anything new
 that matches `ratelimit|quota|retry-after` is preserved verbatim in `extra` as
 JSON, so a header Anthropic starts sending tomorrow is captured today.
 
