@@ -112,6 +112,74 @@ def test_health_reports_open_descriptors(plain_server):
     assert body["fd_limit"] == soft
 
 
+def _chunked_upstream(chunks: list[bytes], gap: float):
+    """Plain HTTP server that dribbles `chunks` out `gap` seconds apart."""
+    import socket
+
+    def run(sock):
+        conn, _ = sock.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n")
+        for payload in chunks:
+            conn.sendall(b"%X\r\n%s\r\n" % (len(payload), payload))
+            time.sleep(gap)
+        conn.sendall(b"0\r\n\r\n")
+        conn.close()
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    threading.Thread(target=run, args=(sock,), daemon=True).start()
+    return sock.getsockname()[1]
+
+
+def test_relay_forwards_each_chunk_as_it_arrives(plain_server):
+    """A streamed response must reach the client chunk by chunk, not buffered
+    until 64K or end of stream."""
+    chunks = [f"data: {i}\n\n".encode() for i in range(4)]
+    gap = 0.3
+    upstream_port = _chunked_upstream(chunks, gap)
+
+    class FakeUpstream:
+        stats = {"pool_dropped": 0, "pool_stale_timeout": 0}
+
+        def send(self, method, path, headers, body):
+            conn = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=5)
+            conn.request(method, path, body=body, headers=headers)
+            return conn, conn.getresponse()
+
+        def give_back(self, conn):
+            conn.close()
+
+    proxy.Proxy.upstream = FakeUpstream()
+    port = plain_server.server_address[1]
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/v1/messages", body=b"{}")
+    resp = conn.getresponse()
+    t0 = time.monotonic()
+    first = resp.read1(65536)
+    first_at = time.monotonic() - t0
+    rest = b""
+    while chunk := resp.read1(65536):
+        rest += chunk
+    conn.close()
+
+    assert first == chunks[0], first
+    assert first_at < gap, f"first chunk held for {first_at:.2f}s"
+    assert first + rest == b"".join(chunks)
+
+
+def test_raise_fd_limit_lifts_soft_limit():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+        assert proxy.raise_fd_limit() >= 1024
+        assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] >= 1024
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
 def test_open_fds_counts_a_new_descriptor(tmp_path):
     before = proxy.open_fds()
     with (tmp_path / "f").open("w"):

@@ -701,6 +701,11 @@ class Upstream:
     STALE_READ_TIMEOUT = 15
     STALE_CHECK_MIN_IDLE = 30
 
+    # The read timeout has to allow for minutes of first-byte latency; a TCP
+    # connect or TLS handshake never legitimately needs that. Left at the read
+    # timeout, a blackholed SYN sits for the kernel's own ~75s retry budget.
+    CONNECT_TIMEOUT = 15
+
     def __init__(self, host: str, timeout: int, resolver: Resolver, size: int = 8):
         self.host, self.timeout, self.size = host, timeout, size
         self.resolver = resolver
@@ -731,10 +736,13 @@ class Upstream:
         if not addresses:
             raise OSError(f"cannot resolve {host}")
         error: Exception | None = None
+        timeout = min(timeout, self.CONNECT_TIMEOUT)
         for candidate in addresses:
             if is_loopback(candidate):
                 continue  # that's us; the hosts entry is not for our benefit
             try:
+                # The socket keeps this timeout through the TLS handshake;
+                # _Connection.connect restores the full one afterwards.
                 return socket.create_connection((candidate, port), timeout,
                                                 source_address)
             except OSError as exc:
@@ -755,8 +763,7 @@ class Upstream:
                     _close(conn)
                     continue
                 return conn, now - idle_since
-        conn = http.client.HTTPSConnection(self.host, timeout=self.timeout,
-                                           context=self.ctx)
+        conn = _Connection(self.host, timeout=self.timeout, context=self.ctx)
         conn._create_connection = self._dial  # type: ignore[method-assign]
         return conn, 0.0
 
@@ -832,6 +839,19 @@ class Upstream:
         sys.stderr.flush()
 
 
+class _Connection(http.client.HTTPSConnection):
+    """HTTPSConnection whose connect+handshake run under Upstream.CONNECT_TIMEOUT.
+
+    The dial hands back a socket carrying the short timeout; the base connect()
+    wraps it for TLS (handshake included) with that timeout still in force,
+    and only then does the socket go back to the long read timeout.
+    """
+
+    def connect(self):
+        super().connect()
+        self.sock.settimeout(self.timeout)
+
+
 def _close(conn):
     try:
         conn.close()
@@ -842,6 +862,30 @@ def _close(conn):
 def open_fds() -> int:
     """Descriptors this process holds open. The listing costs one itself."""
     return len(os.listdir("/dev/fd")) - 1
+
+
+def raise_fd_limit() -> int:
+    """Lift the soft RLIMIT_NOFILE as far as macOS allows; returns the result.
+
+    launchd starts us with the 256 default. Every idle keep-alive client and
+    every pooled upstream connection holds one, and at the ceiling accept()
+    fails with EMFILE and every api.anthropic.com client on the machine hangs.
+    10240 is forty times anything seen so far and far below the point where
+    thread-per-connection would fall over anyway; a genuine leak should crash
+    this process (launchd restarts it) rather than crowd the system table.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    for want in (10240, 4096, 1024):
+        if hard != resource.RLIM_INFINITY:
+            want = min(want, hard)
+        if want <= soft:
+            break
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            return want
+        except (ValueError, OSError):
+            continue
+    return soft
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +976,13 @@ class Proxy(BaseHTTPRequestHandler):
             conn, response = self.upstream.send(self.command, self.path, headers, body)
         except Exception as exc:
             self.counters["errors"] += 1
-            self.log_error("upstream %s: %s", self.path, exc)
+            # Always logged: every one of these is a 502 the client will back
+            # off and retry, i.e. a visible pause, and the health counter
+            # alone can't say when they happened or why.
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            sys.stderr.write(f"[{ts}] upstream-error: {self.command} {self.path}  "
+                             f"error={type(exc).__name__}({exc})\n")
+            sys.stderr.flush()
             self.send_error(502, "upstream unreachable")
             return
 
@@ -965,7 +1015,12 @@ class Proxy(BaseHTTPRequestHandler):
         reusable = True
         try:
             while True:
-                chunk = response.read(65536)
+                # read1, not read: on a chunked body read(n) keeps pulling
+                # chunks until it has n bytes or the stream ends, so an SSE
+                # response would sit here and reach the client in 64K bursts
+                # - a sub-64K reply arrives all at once when it finishes.
+                # read1 hands back whatever the next chunk holds.
+                chunk = response.read1(65536)
                 if not chunk:
                     break
                 if chunked:
@@ -1105,6 +1160,7 @@ class TLSServer(Server):
 
 def serve(args):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd_limit = raise_fd_limit()
     for line in ensure_certs():
         print(line, file=sys.stderr, flush=True)
 
@@ -1143,7 +1199,7 @@ def serve(args):
     expiry = cert_expiry(LEAF_CERT)
     leaf = f", leaf to {expiry:%Y-%m-%d}" if expiry else ""
     print(f"proxy -> https://{UPSTREAM_HOST}  on [::]:{args.tls_port} (tls{leaf}) "
-          f"and 127.0.0.1:{args.port} (plain)  db={args.db}",
+          f"and 127.0.0.1:{args.port} (plain)  db={args.db}  fd_limit={fd_limit}",
           file=sys.stderr, flush=True)
 
     # The accept loop must not be able to die quietly. With the hosts entry in

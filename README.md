@@ -98,7 +98,7 @@ uv run proxy.py uninstall
 launchd : running  pid 80533
 health  : ok, up 2:14:09, 812 requests, 0 errors, 96 rows written, 0 dropped
 pool    : 0 dead pooled conns dropped, 0 stale-timeout recoveries
-fds     : 41 of 256 open
+fds     : 41 of 10240 open
 hosts   : api.anthropic.com -> 127.0.0.1, ::1
 cert    : leaf expires Fri 15 Oct 2027 (396d), CA trusted
 tls     : listening on :443
@@ -240,7 +240,22 @@ little bandwidth on responses; they're small.
 **Connection pooling** — a LIFO pool of TLS connections with a 50s idle TTL,
 because a fresh handshake per turn is a tax you'd feel. A connection error
 before any response byte is retried once on a fresh connection; upstream can't
-have processed a request it never received.
+have processed a request it never received. Connect and handshake get their
+own 15s budget; the long read timeout exists for first-byte latency, not for
+a SYN nobody answers.
+
+**Streaming relays chunk by chunk.** The relay reads upstream with `read1`,
+not `read`: on a chunked body `read(n)` keeps pulling until it has `n` bytes
+or the stream ends, which turned every SSE response into a spinner followed
+by a 64K burst. Upstream failures are logged with a timestamp, always — each
+one is a 502 the client backs off and retries, which reads as a pause.
+
+**File descriptors.** launchd starts the process with a soft limit of 256.
+Every idle keep-alive client and every pooled upstream connection holds one,
+and at the ceiling `accept()` fails and every `api.anthropic.com` client on
+the machine hangs. `serve` raises the soft limit to 10240 at startup — forty
+times anything observed, and low enough that a real leak crashes this process
+(launchd restarts it) rather than crowding the system table.
 
 ## Provenance
 
