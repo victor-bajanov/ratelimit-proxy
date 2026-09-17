@@ -97,6 +97,8 @@ uv run proxy.py uninstall
 ```
 launchd : running  pid 80533
 health  : ok, up 2:14:09, 812 requests, 0 errors, 96 rows written, 0 dropped
+pool    : 0 dead pooled conns dropped, 0 stale-timeout recoveries
+fds     : 41 of 256 open
 hosts   : api.anthropic.com -> 127.0.0.1, ::1
 cert    : leaf expires Fri 15 Oct 2027 (396d), CA trusted
 tls     : listening on :443

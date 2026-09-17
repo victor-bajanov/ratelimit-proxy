@@ -54,6 +54,7 @@ import os
 import plistlib
 import queue
 import re
+import resource
 import secrets
 import select
 import shutil
@@ -838,6 +839,11 @@ def _close(conn):
         pass
 
 
+def open_fds() -> int:
+    """Descriptors this process holds open. The listing costs one itself."""
+    return len(os.listdir("/dev/fd")) - 1
+
+
 # --------------------------------------------------------------------------- #
 # Request rewriting
 # --------------------------------------------------------------------------- #
@@ -899,6 +905,8 @@ class Proxy(BaseHTTPRequestHandler):
             "rows_written": self.recorder.written,
             "rows_dropped": self.recorder.dropped,
             "last_write_error": self.recorder.last_error,
+            "fds": open_fds(),
+            "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0],
         }, indent=2).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1031,6 +1039,21 @@ class TLSProxy(Proxy):
             self.log_error("handshake %s: %s", self.client_address[0], exc)
             raise _Handshake(exc) from None
         super().setup()
+
+    def finish(self):
+        # wrap_socket moved the descriptor into the SSL socket and left the
+        # original object empty. socketserver only ever closes the original,
+        # so this one is ours: left to the GC, a traceback that keeps the
+        # handler alive keeps the descriptor with it, and the process bleeds
+        # to its fd limit one hung-up client at a time.
+        try:
+            super().finish()
+        finally:
+            try:
+                self.request.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            _close(self.request)
 
 
 class Server(ThreadingHTTPServer):
@@ -1325,6 +1348,10 @@ def status(args):
         pool_stale = info.get("pool_stale_timeout", 0)
         print(f"pool    : {pool_dropped} dead pooled conns dropped, "
               f"{pool_stale} stale-timeout recoveries")
+        fds, limit = info.get("fds"), info.get("fd_limit")
+        if fds is not None and limit:
+            warn = "  <- near the limit, restart it" if fds > limit * 0.8 else ""
+            print(f"fds     : {fds} of {limit} open{warn}")
         if info.get("last_write_error"):
             print(f"          last write error: {info['last_write_error']}")
 
