@@ -2,15 +2,19 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Always-on logging proxy for api.anthropic.com.
+"""Always-on logging proxy for api.anthropic.com (and, optionally, claude.ai).
 
-Forwards every request verbatim and records two things to SQLite:
+Forwards every request verbatim and records three things to SQLite:
 
-  * ratelimit  - the `anthropic-ratelimit-unified-*` response headers, which are
-                 the authoritative 5h / 7d plan utilisation signal. Deduped, so
-                 a row appears only when the signal actually moves.
-  * requests   - per-request model + token usage, sniffed out of the response
-                 without disturbing the stream.
+  * ratelimit    - the `anthropic-ratelimit-unified-*` response headers, which
+                   are the authoritative 5h / 7d plan utilisation signal.
+                   Deduped, so a row appears only when the signal actually moves.
+  * requests     - per-request model + token usage, sniffed out of the response
+                   without disturbing the stream.
+  * claude_usage - the claude.ai usage page's own meters, which carry what the
+                   API headers do not: the model-scoped weekly meter and the
+                   split of the week's usage by surface. Only if claude.ai is
+                   also sent through the proxy; see `trust`.
 
 Credentials (Authorization / x-api-key / cookies) are forwarded but never
 logged, and only loopback clients are served.
@@ -72,6 +76,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 UPSTREAM_HOST = "api.anthropic.com"
+CLAUDE_AI_HOST = "claude.ai"
+# Every name the proxy answers for. The first is the default for a request
+# whose Host header names none of them (the plain listener under
+# ANTHROPIC_BASE_URL sends "127.0.0.1:8787"). Which names actually carry
+# traffic is decided by /etc/hosts alone; the code serves all of them.
+UPSTREAMS = (UPSTREAM_HOST, CLAUDE_AI_HOST)
+# The one claude.ai response worth keeping: the usage page's meters.
+USAGE_PATH = re.compile(r"^/api/organizations/([^/]+)/usage$")
 DEFAULT_PORT = 8787
 DEFAULT_TLS_PORT = 443
 LABEL = "id.bajanov.claude-ratelimit-proxy"
@@ -165,6 +177,22 @@ CREATE TABLE IF NOT EXISTS requests (
     duration_ms           INTEGER
 );
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
+
+-- The claude.ai usage page, one row per change. Utilisations are fractions
+-- like the ratelimit table, though the page only ever reports whole percents.
+CREATE TABLE IF NOT EXISTS claude_usage (
+    id                    INTEGER PRIMARY KEY,
+    ts                    INTEGER NOT NULL,
+    org_id                TEXT,
+    five_h_utilization    REAL,
+    five_h_reset          INTEGER,
+    seven_d_utilization   REAL,
+    seven_d_reset         INTEGER,
+    scoped                TEXT,     -- JSON {model display name: weekly fraction}
+    breakdown             TEXT,     -- JSON, seven_day_breakdown verbatim
+    raw                   TEXT      -- the whole payload, for what this misses
+);
+CREATE INDEX IF NOT EXISTS claude_usage_ts ON claude_usage(ts);
 """
 
 # Response header -> ratelimit column. Anything matching KEEP that is not in
@@ -231,6 +259,7 @@ class Recorder:
         self.written = 0
         self.last_error: str | None = None
         self._last_signal: tuple | None = None
+        self._last_usage: tuple | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -265,6 +294,13 @@ class Recorder:
     def request(self, row: dict):
         self._put(("requests", row))
 
+    def claude_usage(self, row: dict):
+        signal = tuple(row[c] for c in USAGE_DEDUP_ON)
+        if signal == self._last_usage:
+            return
+        self._last_usage = signal
+        self._put(("claude_usage", dict(row, ts=int(time.time()))))
+
     def _put(self, item):
         try:
             self.q.put_nowait(item)
@@ -294,6 +330,94 @@ class Recorder:
                 except Exception:
                     pass
                 conn = None
+
+
+# --------------------------------------------------------------------------- #
+# claude.ai usage page
+# --------------------------------------------------------------------------- #
+
+USAGE_DEDUP_ON = ("five_h_utilization", "seven_d_utilization", "scoped", "breakdown")
+USAGE_CAP = 1 << 20  # a usage payload is a few KB; anything bigger is not one
+
+
+def _fraction(value) -> float | None:
+    """The page reports whole percents; store the same unit as the headers."""
+    return value / 100 if isinstance(value, (int, float)) and not isinstance(
+        value, bool) else None
+
+
+def _epoch(value) -> int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def _utilization(node: dict):
+    """A limit's utilisation is either on it or one level down."""
+    if "utilization" in node:
+        return node["utilization"]
+    for child in node.values():
+        if isinstance(child, dict) and "utilization" in child:
+            return child["utilization"]
+    return None
+
+
+def parse_claude_usage(body: bytes, org_id: str | None) -> dict | None:
+    """Flatten GET /api/organizations/<org>/usage into a claude_usage row.
+
+    Shape as observed in Sep 2026: `five_hour` and `seven_day` carry an
+    integer-percent `utilization` and a reset time; `limits[]` carries the
+    model-scoped weekly meters (`kind: weekly_scoped`, scope by display name);
+    `seven_day_breakdown.rows` is the week's usage by surface. Every access is
+    tolerant because the page is not an API and will change without notice;
+    the raw payload rides along so a shape change loses nothing.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    def window(key: str) -> tuple[float | None, int | None]:
+        node = payload.get(key)
+        if not isinstance(node, dict):
+            return None, None
+        reset = next((node[k] for k in ("resets_at", "reset_at", "resets", "reset")
+                      if k in node), None)
+        return _fraction(node.get("utilization")), _epoch(reset)
+
+    five_h, five_h_reset = window("five_hour")
+    seven_d, seven_d_reset = window("seven_day")
+    scoped: dict[str, float] = {}
+    limits = payload.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict) or limit.get("kind") != "weekly_scoped":
+            continue
+        scope = limit.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        name = model.get("display_name") if isinstance(model, dict) else None
+        share = _fraction(_utilization(limit))
+        if isinstance(name, str) and share is not None:
+            scoped[name] = share
+    breakdown = payload.get("seven_day_breakdown")
+    if five_h is None and seven_d is None and not scoped:
+        return None  # not the payload we think it is
+    return {
+        "org_id": org_id,
+        "five_h_utilization": five_h,
+        "five_h_reset": five_h_reset,
+        "seven_d_utilization": seven_d,
+        "seven_d_reset": seven_d_reset,
+        "scoped": json.dumps(scoped, sort_keys=True) if scoped else None,
+        "breakdown": json.dumps(breakdown, sort_keys=True) if breakdown else None,
+        "raw": json.dumps(payload, sort_keys=True),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -516,7 +640,10 @@ keyUsage = critical, keyCertSign, cRLSign
 subjectKeyIdentifier = hash
 """
 
-LEAF_CONFIG = f"""
+def leaf_config() -> str:
+    """One leaf for every name we answer for, so adding a name is a reissue."""
+    names = ", ".join(f"DNS:{host}" for host in UPSTREAMS)
+    return f"""
 [req]
 distinguished_name = dn
 prompt = no
@@ -528,8 +655,17 @@ keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid, issuer
-subjectAltName = DNS:{UPSTREAM_HOST}, DNS:localhost, IP:127.0.0.1, IP:::1
+subjectAltName = {names}, DNS:localhost, IP:127.0.0.1, IP:::1
 """
+
+
+def leaf_names(path: Path) -> set[str]:
+    """DNS names the certificate is valid for; empty when unreadable."""
+    try:
+        text = _openssl("x509", "-noout", "-text", "-in", str(path)).stdout
+    except Exception:
+        return set()
+    return {m.group(1).lower() for m in re.finditer(r"DNS:([^,\s]+)", text)}
 
 
 def _openssl(*argv: str) -> subprocess.CompletedProcess:
@@ -583,10 +719,13 @@ def ensure_certs(force: bool = False) -> list[str]:
         done.append(f"created CA {CA_CERT} (valid {CA_DAYS} days)")
         force = True  # a new CA invalidates any existing leaf
 
-    if force or _expiring(LEAF_CERT, RENEW_WITHIN) or not LEAF_KEY.exists():
+    # A leaf that predates a name being added to UPSTREAMS is reissued too:
+    # the CA is what the keychain trusts, so this costs nothing but a restart.
+    missing = set(UPSTREAMS) - leaf_names(LEAF_CERT) if LEAF_CERT.exists() else set()
+    if force or missing or _expiring(LEAF_CERT, RENEW_WITHIN) or not LEAF_KEY.exists():
         with tempfile.TemporaryDirectory() as tmp:
             config, csr = Path(tmp) / "leaf.cnf", Path(tmp) / "leaf.csr"
-            config.write_text(LEAF_CONFIG)
+            config.write_text(leaf_config())
             _genkey(LEAF_KEY)
             _openssl("req", "-new", "-key", str(LEAF_KEY), "-out", str(csr),
                      "-config", str(config))
@@ -595,7 +734,7 @@ def ensure_certs(force: bool = False) -> list[str]:
                      "-CAserial", str(CERT_DIR / "ca.srl"), "-sha256",
                      "-days", str(LEAF_DAYS), "-out", str(LEAF_CERT),
                      "-extfile", str(config), "-extensions", "v3_leaf")
-        done.append(f"issued leaf for {UPSTREAM_HOST} (valid {LEAF_DAYS} days)")
+        done.append(f"issued leaf for {', '.join(UPSTREAMS)} (valid {LEAF_DAYS} days)")
     return done
 
 
@@ -654,13 +793,13 @@ def _elapsed_seconds(value: str) -> int | None:
     return seconds
 
 
-def hosts_entries() -> list[str]:
-    """Loopback addresses /etc/hosts currently maps the upstream name to."""
+def hosts_entries(host: str = UPSTREAM_HOST) -> list[str]:
+    """Loopback addresses /etc/hosts currently maps the name to."""
     found = []
     try:
         for line in HOSTS_PATH.read_text().splitlines():
             line = line.split("#", 1)[0].split()
-            if len(line) >= 2 and UPSTREAM_HOST in line[1:]:
+            if len(line) >= 2 and host in line[1:]:
                 found.append(line[0])
     except OSError:
         pass
@@ -921,7 +1060,7 @@ class Proxy(BaseHTTPRequestHandler):
     timeout = 900
 
     recorder: Recorder
-    upstream: Upstream
+    upstreams: dict[str, Upstream]  # by name; UPSTREAM_HOST is the default
     started_at: float
     counters: dict
     verbose: bool
@@ -935,17 +1074,29 @@ class Proxy(BaseHTTPRequestHandler):
 
     # -- helpers ----------------------------------------------------------- #
 
+    def _pick_upstream(self) -> str:
+        """The name the client thinks it is talking to, if we answer for it.
+
+        Under the hosts entry every name lands on the same listener, so the
+        Host header is the only thing that says which upstream a request is
+        for. Anything else (the plain listener, a curl at the IP) is api.
+        """
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip().lower()
+        return host if host in self.upstreams else UPSTREAM_HOST
+
     def _health(self):
+        pools = list(self.upstreams.values())
         body = json.dumps({
             "ok": True,
             "pid": os.getpid(),
             "uptime_s": round(time.monotonic() - self.started_at, 1),
             "upstream": UPSTREAM_HOST,
+            "upstreams": list(self.upstreams),
             "db": str(self.recorder.db_path),
             "requests": self.counters["requests"],
             "errors": self.counters["errors"],
-            "pool_dropped": self.upstream.stats["pool_dropped"],
-            "pool_stale_timeout": self.upstream.stats["pool_stale_timeout"],
+            "pool_dropped": sum(p.stats["pool_dropped"] for p in pools),
+            "pool_stale_timeout": sum(p.stats["pool_stale_timeout"] for p in pools),
             "rows_written": self.recorder.written,
             "rows_dropped": self.recorder.dropped,
             "last_write_error": self.recorder.last_error,
@@ -965,6 +1116,8 @@ class Proxy(BaseHTTPRequestHandler):
 
         started = time.monotonic()
         self.counters["requests"] += 1
+        self.upstream_host = self._pick_upstream()
+        upstream = self.upstreams[self.upstream_host]
 
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
@@ -973,25 +1126,28 @@ class Proxy(BaseHTTPRequestHandler):
         #     body = _force_long_context(body)
 
         try:
-            conn, response = self.upstream.send(self.command, self.path, headers, body)
+            conn, response = upstream.send(self.command, self.path, headers, body)
         except Exception as exc:
             self.counters["errors"] += 1
             # Always logged: every one of these is a 502 the client will back
             # off and retry, i.e. a visible pause, and the health counter
             # alone can't say when they happened or why.
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            sys.stderr.write(f"[{ts}] upstream-error: {self.command} {self.path}  "
+            sys.stderr.write(f"[{ts}] upstream-error: {self.upstream_host} "
+                             f"{self.command} {self.path}  "
                              f"error={type(exc).__name__}({exc})\n")
             sys.stderr.flush()
             self.send_error(502, "upstream unreachable")
             return
 
-        try:
-            self._relay(conn, response, started)
-        finally:
-            pass
+        self._relay(upstream, conn, response, started)
 
-    def _relay(self, conn, response, started: float):
+    def _captures_body(self) -> bool:
+        """Only the claude.ai usage page is worth holding a body for."""
+        return (self.upstream_host == CLAUDE_AI_HOST
+                and USAGE_PATH.match(self.path.split("?")[0]) is not None)
+
+    def _relay(self, upstream, conn, response, started: float):
         content_length = response.getheader("Content-Length")
         chunked = content_length is None
 
@@ -1001,7 +1157,13 @@ class Proxy(BaseHTTPRequestHandler):
         seen = set()
         for name, value in response.getheaders():
             key = name.lower()
-            if key in HOP or (chunked and key == "content-length"):
+            # Content-Length is in HOP because we never *forward* the client's
+            # (http.client sets its own), but on the way back it is the body's
+            # framing: drop it only when we re-frame the body as chunked.
+            if key == "content-length":
+                if chunked:
+                    continue
+            elif key in HOP:
                 continue
             seen.add(key)
             self.send_header(name, value)
@@ -1012,6 +1174,7 @@ class Proxy(BaseHTTPRequestHandler):
         self.end_headers()
 
         sniffer = UsageSniffer()
+        captured = bytearray() if self._captures_body() else None
         reusable = True
         try:
             while True:
@@ -1029,6 +1192,8 @@ class Proxy(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                 self.wfile.flush()
                 try:
+                    if captured is not None and len(captured) <= USAGE_CAP:
+                        captured += chunk
                     sniffer.feed(chunk)
                 except Exception:
                     pass  # sniffing is best-effort, the stream is what matters
@@ -1043,16 +1208,27 @@ class Proxy(BaseHTTPRequestHandler):
             self.log_error("stream %s: %s", self.path, exc)
 
         if reusable and response.isclosed():
-            self.upstream.give_back(conn)
+            upstream.give_back(conn)
         else:
             _close(conn)
 
         try:
-            self._record(response, sniffer, started)
+            self._record(response, sniffer, captured, started)
         except Exception as exc:
             self.recorder.last_error = f"record: {type(exc).__name__}: {exc}"
 
-    def _record(self, response, sniffer: UsageSniffer, started: float):
+    def _record(self, response, sniffer: UsageSniffer, captured, started: float):
+        if self.upstream_host != UPSTREAM_HOST:
+            # claude.ai: its rate-limit headers, if any, are not the API's
+            # signal and would only muddy that table. The usage page is all.
+            if captured is not None and response.status == 200 \
+                    and len(captured) <= USAGE_CAP:
+                org = USAGE_PATH.match(self.path.split("?")[0]).group(1)
+                row = parse_claude_usage(bytes(captured), org)
+                if row:
+                    self.recorder.claude_usage(row)
+            return
+
         signal = {name: value for name, value in response.getheaders()
                   if KEEP.search(name) and not SECRET.search(name)}
         request_id = response.getheader("request-id")
@@ -1177,12 +1353,14 @@ def serve(args):
     # upstream actually lives: a wrong answer here is the one failure mode that
     # looks like Anthropic being down.
     resolver = Resolver()
-    found = resolver.resolve(UPSTREAM_HOST)
-    print(f"upstream {UPSTREAM_HOST} -> {', '.join(found) or 'UNRESOLVED'} "
-          f"(via {', '.join(resolver.servers)})", file=sys.stderr, flush=True)
+    Proxy.upstreams = {}
+    for host in UPSTREAMS:
+        found = resolver.resolve(host)
+        print(f"upstream {host} -> {', '.join(found) or 'UNRESOLVED'} "
+              f"(via {', '.join(resolver.servers)})", file=sys.stderr, flush=True)
+        Proxy.upstreams[host] = Upstream(host, timeout=args.timeout, resolver=resolver)
 
     Proxy.recorder = recorder
-    Proxy.upstream = Upstream(UPSTREAM_HOST, timeout=args.timeout, resolver=resolver)
     Proxy.started_at = time.monotonic()
     Proxy.counters = {"requests": 0, "errors": 0}
     Proxy.verbose = args.verbose
@@ -1198,7 +1376,7 @@ def serve(args):
 
     expiry = cert_expiry(LEAF_CERT)
     leaf = f", leaf to {expiry:%Y-%m-%d}" if expiry else ""
-    print(f"proxy -> https://{UPSTREAM_HOST}  on [::]:{args.tls_port} (tls{leaf}) "
+    print(f"proxy -> https://{' | '.join(UPSTREAMS)}  on [::]:{args.tls_port} (tls{leaf}) "
           f"and 127.0.0.1:{args.port} (plain)  db={args.db}  fd_limit={fd_limit}",
           file=sys.stderr, flush=True)
 
@@ -1287,9 +1465,10 @@ def uninstall(args):
         print(f"removed {PLIST_PATH}")
     else:
         print("no launchd agent installed")
+    lines = "; ".join(f"/{host}/d" for host in UPSTREAMS)
     print("\nThe intercept outlives the agent; back it out too, or every\n"
-          f"{UPSTREAM_HOST} request on this machine fails:\n\n"
-          f"  sudo sed -i '' '/{UPSTREAM_HOST}/d' /etc/hosts\n"
+          f"{' and '.join(UPSTREAMS)} request on this machine fails:\n\n"
+          f"  sudo sed -i '' '{lines}' /etc/hosts\n"
           "  sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder\n"
           f"  sudo security delete-certificate -c '{CA_SUBJECT}' {SYSTEM_KEYCHAIN}\n")
     return 0
@@ -1345,6 +1524,19 @@ def trust(args):
         print("  #    step 2 is clean, or you take every client down with it")
         print(f"  printf '\\n{HOSTS_MARK}\\n127.0.0.1 {UPSTREAM_HOST}\\n"
               f"::1 {UPSTREAM_HOST}\\n' | sudo tee -a /etc/hosts")
+        print("  sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder")
+
+    for host in UPSTREAMS[1:]:
+        if hosts_entries(host):
+            print(f"\n  [done] 4. /etc/hosts also sends {host} to "
+                  f"{', '.join(hosts_entries(host))}")
+            continue
+        print(f"\n  # 4. optional: also send {host} to the proxy. That records the")
+        print("  #    usage page's meters (the model-scoped weekly, the split by")
+        print(f"  #    surface). Same caveat as step 3: every {host} client on")
+        print("  #    this machine then runs through this process, browsers and")
+        print("  #    Claude Desktop included. Back it out the same way.")
+        print(f"  printf '127.0.0.1 {host}\\n::1 {host}\\n' | sudo tee -a /etc/hosts")
         print("  sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder")
 
     if os.environ.get("ANTHROPIC_BASE_URL"):
@@ -1411,8 +1603,12 @@ def status(args):
         if info.get("last_write_error"):
             print(f"          last write error: {info['last_write_error']}")
 
-    entries = hosts_entries()
-    print(f"hosts   : {UPSTREAM_HOST} -> {', '.join(entries) if entries else 'NOT intercepted'}")
+    for i, host in enumerate(UPSTREAMS):
+        entries = hosts_entries(host)
+        where = ", ".join(entries) if entries else "NOT intercepted"
+        if not entries and host != UPSTREAM_HOST:
+            where += " (optional)"
+        print(f"{'hosts   :' if i == 0 else '         '} {host} -> {where}")
 
     expiry = cert_expiry(LEAF_CERT)
     if expiry is None:
@@ -1421,6 +1617,10 @@ def status(args):
         left = (expiry - datetime.now(timezone.utc)).days
         print(f"cert    : leaf expires {expiry:%a %d %b %Y} ({left}d), "
               f"CA {'trusted' if ca_trusted() else 'NOT TRUSTED'}")
+        missing = set(UPSTREAMS) - leaf_names(LEAF_CERT)
+        if missing:
+            print(f"          leaf lacks {', '.join(sorted(missing))}; the next "
+                  f"restart reissues it")
     stale = stale_clients()
     if stale:
         print(f"stale   : started before the CA, so will reject it until "
@@ -1459,7 +1659,40 @@ def status(args):
         print(f"\nDENOMINATOR SHIFT {_local(t1)}: 7d jumped {u0 * 100:.0f}% -> "
               f"{u1 * 100:.0f}% on traffic that cannot explain it; the weekly "
               f"cap moved x{u0 / u1:.2f}.  See `proxy.py calibrate`.")
+    _print_claude_usage(args.db)
     return 0
+
+
+def _print_claude_usage(db: Path):
+    """The latest claude.ai usage row, if that intercept has ever been on."""
+    try:
+        with connect(db, readonly=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM claude_usage ORDER BY ts DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return  # older database, table not there yet
+    if row is None:
+        return
+    meters = [(label, row[column]) for label, column in
+              (("5h", "five_h_utilization"), ("7d", "seven_d_utilization"))]
+    meters += [(f"7d {name}", share) for name, share in
+               sorted((json.loads(row["scoped"]) if row["scoped"] else {}).items())]
+    print(f"\nlatest claude.ai usage ({_local(row['ts'])}): "
+          + "  ".join(f"{label} {share * 100:.0f}%" for label, share in meters
+                      if share is not None))
+    rows = (json.loads(row["breakdown"]) or {}).get("rows") if row["breakdown"] else None
+    parts = []
+    for entry in rows if isinstance(rows, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = next((entry[k] for k in ("surface", "key", "name", "label")
+                     if isinstance(entry.get(k), str)), None)
+        share = next((entry[k] for k in ("utilization", "percentage", "share", "percent")
+                      if isinstance(entry.get(k), (int, float))), None)
+        if name and share is not None:
+            parts.append(f"{name} {share:.0f}%")
+    if parts:
+        print(f"  this week by surface: {', '.join(parts)}")
 
 
 def history(args):

@@ -1,7 +1,8 @@
 # claude-ratelimit-proxy
 
-A localhost proxy that sits in front of `api.anthropic.com` and records the
-`anthropic-ratelimit-unified-*` response headers to SQLite.
+A localhost proxy that sits in front of `api.anthropic.com` (and, optionally,
+`claude.ai`) and records the `anthropic-ratelimit-unified-*` response headers
+to SQLite.
 
 Those headers are the authoritative plan-utilisation signal — Anthropic's own
 view of where you sit against the 5h and 7d windows. Everything else (parsing
@@ -145,6 +146,47 @@ implied window cap is a floor; the ratios between counters are the robust
 output. A single-coefficient fit on `credits()` is printed alongside as a
 sanity check against the pricing table.
 
+## claude.ai too (optional)
+
+The API headers carry the 5h and 7d meters and nothing else. The usage page
+at `claude.ai/settings/usage` shows two things they do not: a weekly meter
+scoped to one model (Fable, at the time of writing), and how this week's
+usage splits by surface (Claude Code, chat, Cowork). The proxy can capture
+that page's JSON as it loads, if `claude.ai` is sent through it as well.
+
+The proxy already answers for both names: the leaf certificate carries
+`claude.ai` as a SAN and requests are routed by their `Host` header. What
+decides whether any `claude.ai` traffic actually arrives is a second hosts
+entry, printed by `trust` as an optional step 4:
+
+```
+printf '127.0.0.1 claude.ai\n::1 claude.ai\n' | sudo tee -a /etc/hosts
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+```
+
+Then open the usage page once. Each load that moves a meter adds a row to
+`claude_usage`, and `status` prints the latest one.
+
+The blast radius is the whole of `claude.ai`: the web app, Claude Desktop,
+the Chrome extension, every file upload and every streamed reply all run
+through this one HTTP/1.1 process. Rate-limit headers on `claude.ai`
+responses are deliberately *not* recorded, so the `ratelimit` table stays
+the API's signal alone. If anything on the site misbehaves, delete the two
+`claude.ai` lines from `/etc/hosts` and flush; the API intercept is untouched.
+
+**Untested against Cloudflare, and likely to be challenged.** `claude.ai`
+sits behind Cloudflare bot management. In a dry run (Sep 2026) every request
+the proxy made to it, with or without a full set of Chrome headers, came back
+`403` with `cf-mitigated: challenge`: the "Just a moment" page. The
+`api.anthropic.com` leg is unaffected. Cloudflare is fingerprinting the TLS
+client, which on the upstream side is Python's `ssl`, not the browser's. A
+logged-in browser carries a clearance cookie that may or may not survive
+that mismatch; if it does not, the site loops on the interstitial until the
+hosts lines come out. The way round, if this ever matters enough, is a
+browser-impersonating TLS stack for the `claude.ai` leg only (`curl_cffi`),
+or not intercepting at all and fetching the usage JSON from a real browser
+session on a schedule instead.
+
 ## What else this catches
 
 A hosts entry is machine-wide, so this is no longer just Claude Code's proxy.
@@ -181,6 +223,12 @@ JSON, so a header Anthropic starts sending tomorrow is captured today.
 
 **`requests`** — one row per API request: model, input/output/cache tokens,
 stop reason, duration. Deduped on `request_id`.
+
+**`claude_usage`** — one row per change in the claude.ai usage page, when
+that intercept is on: the 5h and 7d meters as the page reports them (whole
+percents, stored as fractions to match `ratelimit`), the model-scoped weekly
+meters as JSON in `scoped`, the by-surface split verbatim in `breakdown`, and
+the whole payload in `raw` because the page is not an API and will change.
 
 Both are plain SQLite, so ad-hoc questions don't need this tool:
 
@@ -219,6 +267,16 @@ restarts the agent — hence the renew-on-startup and the expiry in `status`.
 The plain-HTTP listener on `127.0.0.1:8787` stays up as a second way back in:
 if TLS or the certificate is the thing that's broken, `ANTHROPIC_BASE_URL`
 still works while you sort it out.
+
+**Restart with Cloudflare WARP disconnected.** The proxy reads its
+nameservers from `/etc/resolv.conf` once, at startup, and queries them
+directly to get past the hosts entry. With WARP connected that file names
+WARP's local stub (`127.0.2.2`), and the stub honours `/etc/hosts`: the proxy
+asks it for `api.anthropic.com`, gets `127.0.0.1` back, recognises itself and
+fails every request with `no usable address`. A proxy started while WARP was
+off keeps the real nameservers and is fine across the tunnel, so the rule is
+disconnect WARP, restart the proxy, reconnect WARP. Reverting code does not
+help; this is DNS, not the proxy.
 
 **Credentials** are forwarded and never written. The `SECRET` pattern excludes
 anything matching `authorization|api-key|cookie|token|secret` from the record
