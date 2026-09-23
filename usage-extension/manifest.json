@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "claude.ai usage capture",
+  "version": "0.1.0",
+  "description": "When a claude.ai page loads its usage JSON, re-fetch it and hand it to the local ratelimit proxy.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["webRequest"],
+  "host_permissions": ["https://claude.ai/*", "http://127.0.0.1:8787/*"]
+}

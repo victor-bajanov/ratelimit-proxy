@@ -12,6 +12,11 @@ Forwards every request verbatim and records two things to SQLite:
   * requests   - per-request model + token usage, sniffed out of the response
                  without disturbing the stream.
 
+A third table, claude_usage, holds the claude.ai usage page's own meters: the
+model-scoped weekly meter and the week's split by surface, which the API
+headers do not carry. The browser extension in usage-extension/ POSTs them to
+/__proxy/claude-usage on the plain listener; nothing on claude.ai is proxied.
+
 Credentials (Authorization / x-api-key / cookies) are forwarded but never
 logged, and only loopback clients are served.
 
@@ -46,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import http.client
 import ipaddress
 import json
@@ -165,6 +171,22 @@ CREATE TABLE IF NOT EXISTS requests (
     duration_ms           INTEGER
 );
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
+
+-- The claude.ai usage page, one row per change. Utilisations are fractions
+-- like the ratelimit table, though the page only ever reports whole percents.
+CREATE TABLE IF NOT EXISTS claude_usage (
+    id                    INTEGER PRIMARY KEY,
+    ts                    INTEGER NOT NULL,
+    org_id                TEXT,
+    five_h_utilization    REAL,
+    five_h_reset          INTEGER,
+    seven_d_utilization   REAL,
+    seven_d_reset         INTEGER,
+    scoped                TEXT,     -- JSON {model display name: weekly fraction}
+    breakdown             TEXT,     -- JSON, seven_day_breakdown verbatim
+    raw                   TEXT      -- the whole payload, for what this misses
+);
+CREATE INDEX IF NOT EXISTS claude_usage_ts ON claude_usage(ts);
 """
 
 # Response header -> ratelimit column. Anything matching KEEP that is not in
@@ -196,6 +218,36 @@ MIGRATIONS = {"ratelimit": {"request_id": "TEXT"}}
 DEDUP_ON = ("status", "five_h_status", "five_h_utilization", "five_h_reset",
             "seven_d_status", "seven_d_utilization", "seven_d_reset",
             "opus_status", "opus_utilization", "overage_status", "retry_after")
+# Same idea for the claude.ai usage page, which the page itself fetches several
+# times per load.
+USAGE_DEDUP_ON = ("org_id", "five_h_utilization", "seven_d_utilization", "scoped",
+                  "breakdown")
+
+
+def _breakdown_signal(breakdown: str | None) -> str | None:
+    """The breakdown as the dedup should compare it; the stored row keeps it
+    verbatim. claude.ai stamps `as_of` on every response (0.3 s apart in the
+    spike's captures), so it is dropped, and `window_started_at` jitters below
+    the second between responses (.952333 then .903325, 37 s apart, live on
+    23 Sep), so it is rounded to the nearest minute. Rounding rather than
+    truncating, because the jitter sits right on the hour and could straddle
+    it; a real window moves by a week."""
+    try:
+        parsed = json.loads(breakdown) if breakdown else None
+    except ValueError:
+        return breakdown
+    if not isinstance(parsed, dict):
+        return breakdown
+    parsed.pop("as_of", None)
+    started = parsed.get("window_started_at")
+    try:
+        when = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        pass  # not a time: compared as it is
+    else:
+        when += timedelta(seconds=30)
+        parsed["window_started_at"] = when.replace(second=0, microsecond=0).isoformat()
+    return json.dumps(parsed, sort_keys=True)
 
 
 def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
@@ -231,6 +283,7 @@ class Recorder:
         self.written = 0
         self.last_error: str | None = None
         self._last_signal: tuple | None = None
+        self._last_usage: tuple | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -265,6 +318,15 @@ class Recorder:
     def request(self, row: dict):
         self._put(("requests", row))
 
+    def claude_usage(self, row: dict):
+        """A parse_claude_usage row plus `ts`, the time it was observed."""
+        signal = tuple(_breakdown_signal(row[c]) if c == "breakdown" else row[c]
+                       for c in USAGE_DEDUP_ON)
+        if signal == self._last_usage:
+            return
+        self._last_usage = signal
+        self._put(("claude_usage", row))
+
     def _put(self, item):
         try:
             self.q.put_nowait(item)
@@ -294,6 +356,162 @@ class Recorder:
                 except Exception:
                     pass
                 conn = None
+            finally:
+                self.q.task_done()  # lets tests join the queue instead of sleeping
+
+
+# --------------------------------------------------------------------------- #
+# claude.ai usage page
+# --------------------------------------------------------------------------- #
+
+# The usage page reaches us from the browser extension in usage-extension/,
+# POSTed to the plain listener. Chrome extension ids are 32 letters a-p.
+EXTENSION_ORIGIN = re.compile(r"chrome-extension://[a-p]{32}")
+INGEST_CAP = 256 * 1024  # a usage payload is a few KB; anything bigger is not one
+INGEST_READ_TIMEOUT = 10  # seconds for the whole body, not the listener's 900
+
+
+def _number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _fraction(value) -> float | None:
+    """The page reports whole percents; store the same unit as the headers."""
+    return value / 100 if _number(value) else None
+
+
+def _epoch(value) -> int | None:
+    """Epoch seconds from a number or an ISO string; None for anything that
+    is not a time a datetime can hold."""
+    try:
+        if _number(value):
+            return int(datetime.fromtimestamp(value, timezone.utc).timestamp())
+        if isinstance(value, str):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"number out of range: {text[:20]}")
+    return value
+
+
+def _no_constant(name: str):
+    raise ValueError(f"{name} is not JSON")
+
+
+def _strict_json(body: bytes):
+    """json.loads without NaN, Infinity or numbers that overflow to them.
+    Raises ValueError for those, like any other malformed JSON."""
+    return json.loads(body, parse_float=_finite_float, parse_constant=_no_constant)
+
+
+def _utilization(node: dict):
+    """A limit's utilisation is either on it or one level down."""
+    if "utilization" in node:
+        return node["utilization"]
+    for child in node.values():
+        if isinstance(child, dict) and "utilization" in child:
+            return child["utilization"]
+    return None
+
+
+def parse_claude_usage(body: bytes, org_id: str | None) -> dict | None:
+    """Flatten GET /api/organizations/<org>/usage into a claude_usage row.
+
+    Shape as observed in Sep 2026: `five_hour` and `seven_day` carry an
+    integer-percent `utilization` and a reset time; `limits[]` carries the
+    model-scoped weekly meters (`kind: weekly_scoped`, scope by display name);
+    `seven_day_breakdown.rows` is the week's usage by surface. Every access is
+    tolerant because the page is not an API and will change without notice;
+    the raw payload rides along so a shape change loses nothing.
+
+    The payload itself names no org, so `org_id` is whatever the caller took
+    from the request URL.
+    """
+    try:
+        payload = _strict_json(body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    def window(key: str) -> tuple[float | None, int | None]:
+        node = payload.get(key)
+        if not isinstance(node, dict):
+            return None, None
+        reset = next((node[k] for k in ("resets_at", "reset_at", "resets", "reset")
+                      if k in node), None)
+        return _fraction(node.get("utilization")), _epoch(reset)
+
+    five_h, five_h_reset = window("five_hour")
+    seven_d, seven_d_reset = window("seven_day")
+    scoped: dict[str, float] = {}
+    limits = payload.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict) or limit.get("kind") != "weekly_scoped":
+            continue
+        scope = limit.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        name = model.get("display_name") if isinstance(model, dict) else None
+        share = _fraction(_utilization(limit))
+        if isinstance(name, str) and share is not None:
+            scoped[name] = share
+    breakdown = payload.get("seven_day_breakdown")
+    if five_h is None and seven_d is None and not scoped:
+        return None  # not the payload we think it is
+    return {
+        "org_id": org_id,
+        "five_h_utilization": five_h,
+        "five_h_reset": five_h_reset,
+        "seven_d_utilization": seven_d,
+        "seven_d_reset": seven_d_reset,
+        "scoped": json.dumps(scoped, sort_keys=True) if scoped else None,
+        "breakdown": json.dumps(breakdown, sort_keys=True) if breakdown else None,
+        "raw": json.dumps(payload, sort_keys=True),
+    }
+
+
+ORG_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+OBSERVED_SKEW = 86400  # the extension posts at once; a day off is a bug
+
+
+def parse_usage_envelope(body: bytes) -> dict | None:
+    """Turn the extension's POST into a claude_usage row, or None.
+
+    The envelope is {org_id, observed_at, payload}: org_id from the URL the
+    page fetched, observed_at as JS Date.toISOString() puts it (an ISO 8601
+    string with a zone), payload the usage JSON object untouched. The payload
+    names no org, so the envelope's org_id is the only one there is.
+    """
+    try:
+        envelope = _strict_json(body)
+    except Exception:
+        return None
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("payload"), dict):
+        return None
+    org_id = envelope.get("org_id")
+    if not isinstance(org_id, str) or not ORG_ID.fullmatch(org_id):
+        return None
+    # Stricter than the payload's own reset times: a naive string would be
+    # read as local time, which is exactly the kind of slip to catch here.
+    observed = envelope.get("observed_at")
+    try:
+        when = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        return None
+    ts = int(when.timestamp())
+    if abs(ts - time.time()) > OBSERVED_SKEW:
+        return None
+    row = parse_claude_usage(json.dumps(envelope["payload"]).encode(), org_id)
+    return dict(row, ts=ts) if row else None
 
 
 # --------------------------------------------------------------------------- #
@@ -925,6 +1143,9 @@ class Proxy(BaseHTTPRequestHandler):
     started_at: float
     counters: dict
     verbose: bool
+    # Whether this listener takes the usage extension's POSTs. Only the plain
+    # one does: the browser reaches it by address, and TLS is for the API.
+    ingests_usage = True
 
     def log_message(self, *args):  # launchd logs are for errors only
         pass
@@ -958,9 +1179,92 @@ class Proxy(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _refuse(self, code: int, **headers: str):
+        """A bodiless 4xx that closes the connection, since whatever body the
+        client sent may still be sitting unread on the socket."""
+        self.send_response(code)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _read_body(self, length: int) -> bytes | None:
+        """The request body, or None if it took longer than INGEST_READ_TIMEOUT
+        in all. A socket timeout alone is per read, so a client trickling a
+        byte at a time could hold this thread for the listener's 900 s.
+        Raises ConnectionAbortedError if the client hangs up part way."""
+        deadline = time.monotonic() + INGEST_READ_TIMEOUT
+        body = bytearray()
+        try:
+            while len(body) < length:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.connection.settimeout(left)
+                chunk = self.rfile.read1(length - len(body))
+                if not chunk:
+                    raise ConnectionAbortedError("client hung up mid-body")
+                body += chunk
+        except TimeoutError:
+            return None
+        finally:
+            self.connection.settimeout(self.timeout)
+        return bytes(body)
+
+    def _ingest_usage(self):
+        """POST /__proxy/claude-usage: the usage page, as the extension saw it."""
+        if self.command != "POST":
+            self._refuse(405, Allow="POST")
+            return
+        # Any page in the browser can POST to 127.0.0.1, but only an extension
+        # can send this Origin; a page can neither forge nor omit its own.
+        if not EXTENSION_ORIGIN.fullmatch(self.headers.get("Origin") or ""):
+            self._refuse(403)
+            return
+        # And JSON is not a "simple" content type, so a page that tried anyway
+        # would be preflighted, which this server never approves.
+        if self.headers.get_content_type() != "application/json":
+            self._refuse(415)
+            return
+        # Sized from the header before a byte is read, so a bogus claim costs
+        # nothing. Chunked bodies are refused rather than decoded by hand.
+        length = self.headers.get("Content-Length")
+        if length is None:
+            self._refuse(411)
+            return
+        if not re.fullmatch(r"[0-9]+", length):
+            self._refuse(400)
+            return
+        # Nine digits is already far past the cap, and int() refuses outright
+        # past 4300, so count before converting.
+        if len(length) > 9 or int(length) > INGEST_CAP:
+            self._refuse(413)
+            return
+        try:
+            body = self._read_body(int(length))
+        except ConnectionAbortedError:
+            self.close_connection = True  # nobody left to answer
+            return
+        if body is None:
+            self._refuse(408)
+            return
+        row = parse_usage_envelope(body)
+        if row is None:
+            self._refuse(422)
+            return
+        self.recorder.claude_usage(row)
+        self.send_response(204)
+        self.end_headers()
+
     def _forward(self):
         if self.path.startswith("/__proxy/"):
-            self._health() if self.path == "/__proxy/health" else self.send_error(404)
+            if self.path == "/__proxy/health":
+                self._health()
+            elif self.path == "/__proxy/claude-usage" and self.ingests_usage:
+                self._ingest_usage()
+            else:
+                self.send_error(404)
             return
 
         started = time.monotonic()
@@ -1084,6 +1388,8 @@ class _Handshake(Exception):
 
 class TLSProxy(Proxy):
     """Same proxy, reached by impersonating the upstream name over TLS."""
+
+    ingests_usage = False
 
     def setup(self):
         # Handshake here rather than at accept(), so a slow or dead client
@@ -1445,6 +1751,7 @@ def status(args):
     print(f"db      : {args.db}  ({samples} signal rows, {reqs} requests)")
     if row is None:
         print("signal  : nothing recorded yet")
+        _print_claude_usage(args.db)
         return 0
     print(f"\nlatest signal ({_local(row['ts'])}), status {row['status']}:")
     for label, util, reset in (("5h ", row["five_h_utilization"], row["five_h_reset"]),
@@ -1459,7 +1766,49 @@ def status(args):
         print(f"\nDENOMINATOR SHIFT {_local(t1)}: 7d jumped {u0 * 100:.0f}% -> "
               f"{u1 * 100:.0f}% on traffic that cannot explain it; the weekly "
               f"cap moved x{u0 / u1:.2f}.  See `proxy.py calibrate`.")
+    _print_claude_usage(args.db)
     return 0
+
+
+def _print_claude_usage(db: Path):
+    """The latest claude.ai usage row, if the extension has ever sent one."""
+    try:
+        # closing(), not the connection's own `with`, which only commits.
+        with contextlib.closing(connect(db, readonly=True)) as conn:
+            row = conn.execute("SELECT * FROM claude_usage "
+                               "ORDER BY ts DESC, id DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return  # older database, table not there yet
+    if row is None:
+        return
+    meters = [(label, row[column]) for label, column in
+              (("5h", "five_h_utilization"), ("7d", "seven_d_utilization"))]
+    meters += [(f"7d {name}", share) for name, share in
+               sorted((json.loads(row["scoped"]) if row["scoped"] else {}).items())]
+    print(f"\nlatest claude.ai usage ({_local(row['ts'])}): "
+          + "  ".join(f"{label} {share * 100:.0f}%" for label, share in meters
+                      if share is not None))
+    if not row["breakdown"]:
+        return
+    # As captured on 23 Sep: rows of {key, display_name, percent}, in the
+    # page's own order. Anything else is shown raw rather than guessed at.
+    breakdown = json.loads(row["breakdown"])
+    rows = breakdown.get("rows") if isinstance(breakdown, dict) else None
+    parts = []
+    for entry in rows if isinstance(rows, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        label = next((entry[k] for k in ("display_name", "key")
+                      if isinstance(entry.get(k), str)), None)
+        share = entry.get("percent")
+        if label and isinstance(share, (int, float)) and not isinstance(share, bool):
+            parts.append(f"{label} {share:.0f}%")
+    if parts:
+        print(f"  this week by surface: {', '.join(parts)}")
+    else:
+        raw = json.dumps(breakdown, separators=(",", ":"))
+        print("  this week by surface: (unrecognised) "
+              + (raw if len(raw) <= 60 else raw[:57] + "..."))
 
 
 def history(args):

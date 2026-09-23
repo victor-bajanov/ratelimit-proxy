@@ -165,6 +165,30 @@ server certificates even under a locally added root. `serve` reissues it
 automatically once it is within 30 days of expiry; the CA is untouched, so the
 keychain trust survives.
 
+## claude.ai usage by surface
+
+The API headers give one 7d number for the whole account. claude.ai's usage
+page also splits the week by surface (Claude Code, Chats, Cowork, Other) and
+shows the model-scoped weekly meters. The Chrome extension in
+[`usage-extension/`](usage-extension/README.md) picks that up. Whenever a
+claude.ai page fetches its usage JSON, the extension re-fetches it with the
+browser's cookies and POSTs it to `POST /__proxy/claude-usage` on the plain
+listener. The proxy never relays claude.ai traffic; this endpoint only receives
+what the extension sends.
+
+The endpoint only takes JSON from a `chrome-extension://` origin, up to 256 KB,
+and sends no CORS headers, so an ordinary web page can't write to it. It
+accepts *any* extension id, so another installed extension with access to
+127.0.0.1 could plant false rows. It couldn't read anything, and nothing is
+relayed; pinning the id is left for later. The TLS listener doesn't serve the
+endpoint at all. The extension has port 8787 hard-coded, so a proxy on another
+`--port` needs the extension changed too. `status` gains two lines once a row exists:
+
+```
+latest claude.ai usage (Wed 23 Sep 15:40): 5h …%  7d …%  7d <model> …%
+  this week by surface: Claude Code 79%, Chats 2%, Cowork 19%, Other 0%
+```
+
 ## Data
 
 `~/.claude/ratelimit-proxy/ratelimit.db`, WAL mode, safe to read while the
@@ -182,7 +206,13 @@ JSON, so a header Anthropic starts sending tomorrow is captured today.
 **`requests`** — one row per API request: model, input/output/cache tokens,
 stop reason, duration. Deduped on `request_id`.
 
-Both are plain SQLite, so ad-hoc questions don't need this tool:
+**`claude_usage`** — one row per *change* in the claude.ai usage page, as sent
+by the extension: org, 5h and 7d utilisation and resets (fractions, like
+`ratelimit`, though the page only reports whole percents), the model-scoped
+weekly meters in `scoped`, `seven_day_breakdown` verbatim in `breakdown`, and
+the whole payload in `raw` so a shape change loses nothing.
+
+All three are plain SQLite, so ad-hoc questions don't need this tool:
 
 ```sql
 -- when did the 7d window last cross 80%?
