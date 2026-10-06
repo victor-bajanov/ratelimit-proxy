@@ -705,5 +705,15 @@ def test_open_fds_counts_a_new_descriptor(tmp_path):
     assert proxy.open_fds() == before
 
 
+@pytest.mark.parametrize("model, per_mtok_in, per_mtok_out", [
+    ("claude-opus-5-5", 533_334, 2_666_667),    # $4 / $20
+    ("claude-sonnet-5-5", 266_667, 1_333_334),  # $2 / $10
+])
+def test_credits_prices_the_5_5_models(model, per_mtok_in, per_mtok_out):
+    assert proxy.credits(model, 1_000_000, 0, 0) == per_mtok_in
+    assert proxy.credits(model, 0, 0, 1_000_000) == per_mtok_in, "cache writes at input rate"
+    assert proxy.credits(model, 0, 1_000_000, 0) == per_mtok_out
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", *sys.argv[1:]]))
