@@ -715,5 +715,33 @@ def test_credits_prices_the_5_5_models(model, per_mtok_in, per_mtok_out):
     assert proxy.credits(model, 0, 1_000_000, 0) == per_mtok_out
 
 
+def test_credits_prices_haiku_5_5_short_prompts_at_the_base_tier():
+    # $0.10 / $0.50 for prompts up to 100K tokens
+    assert proxy.credits("claude-haiku-5-5", 100_000, 0, 0) == 1_334
+    assert proxy.credits("claude-haiku-5-5", 0, 1_000_000, 0) == 66_667
+    assert proxy.credits("claude-haiku-5-5", 40_000, 0, 30_000, cache_read=30_000) == 934
+
+
+def test_credits_prices_haiku_5_5_long_prompts_at_the_upper_tier():
+    # $0.50 / $2.50 once the prompt, cache reads included, passes 100K tokens
+    assert proxy.credits("claude-haiku-5-5", 100_001, 0, 0) == 6_667
+    assert proxy.credits("claude-haiku-5-5", 1_500, 1_000_000, 0,
+                         cache_read=150_000) == 333_434
+    assert proxy.credits("claude-haiku-5-5", 60_000, 0, 50_000) == 7_334
+
+
+def test_credits_between_counts_cache_reads_toward_the_long_prompt_tier(tmp_path):
+    with proxy.connect(tmp_path / "r.db") as conn:
+        conn.execute(
+            "INSERT INTO requests (ts, model, input_tokens, output_tokens, "
+            "cache_creation_tokens, cache_read_tokens) VALUES (?, ?, ?, ?, ?, ?)",
+            (100, "claude-haiku-5-5", 15_000, 0, 0, 90_000))
+        assert proxy._credits_between(conn, 0, 200) == 1_000  # $0.50 tier, not 200
+
+
+def test_credits_ignores_cache_reads_for_untiered_models():
+    assert proxy.credits("claude-opus-5-5", 1_000_000, 0, 0, cache_read=5_000_000) == 533_334
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", *sys.argv[1:]]))

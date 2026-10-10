@@ -177,7 +177,8 @@ class Requests:
                 counts[k] += r[col] or 0
             iv.credits += credits(r["model"], r["input_tokens"] or 0,
                                   r["output_tokens"] or 0,
-                                  r["cache_creation_tokens"] or 0)
+                                  r["cache_creation_tokens"] or 0,
+                                  r["cache_read_tokens"] or 0)
             iv.n += 1
 
 

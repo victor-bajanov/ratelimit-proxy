@@ -118,15 +118,24 @@ PRICE = {"claude-fable-5": (10, 50), "claude-fable-5-1": (10, 50),
          "claude-opus-4-8": (5, 25), "claude-opus-4-7": (5, 25),
          "claude-sonnet-5-5": (2, 10), "claude-sonnet-5": (2, 10),
          "claude-sonnet-4-6": (3, 15), "claude-haiku-4-5-20251001": (1, 5),
-         "claude-haiku-4-5": (1, 5)}
+         "claude-haiku-4-5": (1, 5), "claude-haiku-5-5": (0.1, 0.5)}
+# Models priced higher once the prompt (input + cache writes + cache reads)
+# passes a size: model -> (prompt tokens, $/Mtok in, $/Mtok out).
+LONG_PROMPT_PRICE = {"claude-haiku-5-5": (100_000, 0.5, 2.5)}
 
 
-def credits(model: str, inp: int, out: int, cache_write: int) -> int:
-    """Plan credits for one request. Unknown models cost nothing we can price."""
+def credits(model: str, inp: int, out: int, cache_write: int,
+            cache_read: int = 0) -> int:
+    """Plan credits for one request. Unknown models cost nothing we can price.
+
+    Cache reads are free; they count only toward a long-prompt price tier."""
     price = PRICE.get(model)
     if not price:
         return 0
     pin, pout = price
+    tier = LONG_PROMPT_PRICE.get(model)
+    if tier and inp + cache_write + cache_read > tier[0]:
+        pin, pout = tier[1], tier[2]
     return math.ceil((inp + cache_write) * pin * 2 / 15 + out * pout * 2 / 15)
 
 
@@ -1850,7 +1859,7 @@ def usage(args):
     for row in rows:
         agg = per[row["model"]]
         cost = credits(row["model"], row["input_tokens"], row["output_tokens"],
-                       row["cache_creation_tokens"])
+                       row["cache_creation_tokens"], row["cache_read_tokens"] or 0)
         agg[0] += 1
         agg[1] += cost
         agg[2] += row["input_tokens"]
@@ -1901,10 +1910,11 @@ def _oi(row) -> float | None:
 
 def _credits_between(conn, t0: int, t1: int) -> int:
     rows = conn.execute(
-        "SELECT model, input_tokens i, output_tokens o, cache_creation_tokens c "
+        "SELECT model, input_tokens i, output_tokens o, cache_creation_tokens c, "
+        "cache_read_tokens r "
         "FROM requests WHERE model IS NOT NULL AND model != '' "
         "AND ts > ? AND ts <= ?", (t0, t1))
-    return sum(credits(r["model"], r["i"], r["o"], r["c"]) for r in rows)
+    return sum(credits(r["model"], r["i"], r["o"], r["c"], r["r"] or 0) for r in rows)
 
 
 def _shifts(conn, cap: float, since: int = 0):
