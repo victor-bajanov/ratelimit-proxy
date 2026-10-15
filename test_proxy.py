@@ -745,3 +745,16 @@ def test_credits_ignores_cache_reads_for_untiered_models():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", *sys.argv[1:]]))
+
+
+def test_ca_trusted_means_macos_trusts_it_not_just_that_it_is_in_the_keychain(
+        tmp_path, monkeypatch):
+    # A restore can leave the CA in System.keychain with its trust settings
+    # gone. Same subject as ours, never trusted: must not read as trusted.
+    cert = tmp_path / "ca.pem"
+    subprocess.run([proxy.OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(tmp_path / "ca.key"), "-out", str(cert),
+                    "-subj", f"/CN={proxy.CA_SUBJECT}", "-days", "1"],
+                   check=True, capture_output=True)
+    monkeypatch.setattr(proxy, "CA_CERT", cert)
+    assert proxy.ca_trusted() is False

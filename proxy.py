@@ -828,9 +828,14 @@ def ensure_certs(force: bool = False) -> list[str]:
 
 
 def ca_trusted() -> bool:
-    """Whether our CA is sitting in the system keychain."""
-    return subprocess.run(["security", "find-certificate", "-c", CA_SUBJECT,
-                           SYSTEM_KEYCHAIN], capture_output=True).returncode == 0
+    """Whether macOS actually trusts our CA as an SSL root.
+
+    Presence in the system keychain is not enough: trust settings are stored
+    apart from the certificate, and a restore from backup can bring back the
+    one without the other. Ask the trust evaluator instead.
+    """
+    return subprocess.run(["security", "verify-cert", "-c", str(CA_CERT),
+                           "-p", "ssl"], capture_output=True).returncode == 0
 
 
 def stale_clients() -> list[str]:
