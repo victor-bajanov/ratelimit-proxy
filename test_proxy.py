@@ -806,3 +806,34 @@ def test_ca_trusted_means_macos_trusts_it_not_just_that_it_is_in_the_keychain(
                    check=True, capture_output=True)
     monkeypatch.setattr(proxy, "CA_CERT", cert)
     assert proxy.ca_trusted() is False
+
+
+def _local_ts(y, mo, d, h=12) -> int:
+    from datetime import datetime
+    return int(datetime(y, mo, d, h).timestamp())
+
+
+@pytest.mark.parametrize("when, cap", [
+    ((2026, 9, 1), 125_000_000),   # Max 20x, +50% weekly promotion
+    ((2026, 10, 1), 104_166_666),  # Max 20x, permanent +25% from 14 Sep
+    ((2026, 10, 17), 104_166_666),
+    ((2026, 10, 19), 52_083_375),  # Max 5x from 18 Oct
+])
+def test_weekly_cap_follows_the_plan_and_promotion_in_force(when, cap):
+    assert proxy.weekly_cap(_local_ts(*when)) == pytest.approx(cap, abs=1)
+
+
+@pytest.mark.parametrize("day, flagged", [(16, True), (19, False)])
+def test_shifts_judge_each_jump_against_the_cap_in_force_then(tmp_path, day, flagged):
+    """3M credits explain a 10-point jump on a 52M week, not on a 104M one."""
+    t0 = _local_ts(2026, 10, day)
+    with proxy.connect(tmp_path / "s.db") as conn:
+        for ts, util in ((t0, 0.10), (t0 + 3600, 0.20)):
+            conn.execute("INSERT INTO ratelimit (ts, seven_d_utilization, seven_d_reset) "
+                         "VALUES (?, ?, ?)", (ts, util, t0 + 86400))
+        conn.execute("INSERT INTO requests (ts, model, input_tokens, output_tokens, "
+                     "cache_creation_tokens, cache_read_tokens) VALUES (?, ?, ?, 0, 0, 0)",
+                     (t0 + 60, "claude-opus-5", 4_500_000))  # 3,000,000 credits
+        found, examined = proxy._shifts(conn)
+    assert examined == 1
+    assert bool(found) is flagged

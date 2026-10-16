@@ -1768,7 +1768,7 @@ def status(args):
         row = conn.execute("SELECT * FROM ratelimit ORDER BY ts DESC LIMIT 1").fetchone()
         samples = conn.execute("SELECT COUNT(*) c FROM ratelimit").fetchone()["c"]
         reqs = conn.execute("SELECT COUNT(*) c FROM requests").fetchone()["c"]
-        shifts, _ = _shifts(conn, PROMO_WEEKLY, since=_since(14))
+        shifts, _ = _shifts(conn, since=_since(14))
     print(f"db      : {args.db}  ({samples} signal rows, {reqs} requests)")
     if row is None:
         print("signal  : nothing recorded yet")
@@ -1904,9 +1904,27 @@ def usage(args):
 # weekly allowance is invisible in the number itself -- it shows up only as a
 # jump no recorded traffic can account for. Anthropic ran a +50% weekly
 # promotion through Sep 2026 and replaced it with a permanent +25%, so this
-# does move. Nominal figure from she-llac.com/claude-limits (Max 20x).
-NOMINAL_WEEKLY = 83_333_333
-PROMO_WEEKLY = int(NOMINAL_WEEKLY * 1.5)
+# does move, as does the plan itself. Nominal figures from
+# she-llac.com/claude-limits. Each entry holds from its start until the next:
+# (start, plan, nominal weekly credits, multiplier in force).
+PLANS = (
+    (0, "Max 20x", 83_333_333, 1.5),
+    # 14 Sep US time; the +25% held for every week fitted since.
+    (int(datetime(2026, 9, 14, 7, tzinfo=timezone.utc).timestamp()),
+     "Max 20x", 83_333_333, 1.25),
+    (int(datetime(2026, 10, 17, 13, tzinfo=timezone.utc).timestamp()),  # 18 Oct AEDT
+     "Max 5x", 41_666_700, 1.25),
+)
+
+
+def plan_at(ts: float) -> tuple:
+    return [p for p in PLANS if p[0] <= ts][-1]
+
+
+def weekly_cap(ts: float) -> float:
+    """The weekly denominator in force at `ts`, in credits."""
+    _, _, nominal, mult = plan_at(ts)
+    return nominal * mult
 # The proxy only sees one machine's traffic; measured against the headers it
 # accounts for roughly half to three quarters of what the account is charged.
 # Detection assumes the pessimistic end so quiet windows do not false-positive.
@@ -1937,12 +1955,13 @@ def _credits_between(conn, t0: int, t1: int) -> int:
     return sum(credits(r["model"], r["i"], r["o"], r["c"], r["r"] or 0) for r in rows)
 
 
-def _shifts(conn, cap: float, since: int = 0):
+def _shifts(conn, cap: float | None = None, since: int = 0):
     """Utilisation jumps too large for the traffic recorded between them.
 
     Both readings are scaled by the same unrecorded-traffic factor, so their
     ratio reads the denominator cleanly even though the proxy sees only part of
-    the account's usage.
+    the account's usage. Without `cap`, each jump is judged against the plan
+    in force when it happened.
     """
     rows = conn.execute(
         "SELECT ts, seven_d_utilization u, seven_d_reset r FROM ratelimit "
@@ -1955,7 +1974,7 @@ def _shifts(conn, cap: float, since: int = 0):
         examined += 1
         spent = _credits_between(conn, prev["ts"], row["ts"])
         # 0.01 of quantisation on each reading, plus whatever traffic explains.
-        explained = spent / VISIBLE_SHARE / cap + 0.02
+        explained = spent / VISIBLE_SHARE / (cap or weekly_cap(row["ts"])) + 0.02
         if abs(row["u"] - prev["u"]) > explained:
             found.append((prev["ts"], row["ts"], prev["u"], row["u"], spent))
     return found, examined
@@ -2000,10 +2019,12 @@ def calibrate(args):
         shifts, examined = _shifts(conn, args.cap)
 
     util = latest["seven_d_utilization"]
+    _, plan, nominal, _ = plan_at(latest["ts"])
     print(f"7d window : {_local(start)} -> {_local(reset)}")
     print(f"reported  : {util * 100:.0f}% at {_local(latest['ts'])}"
           f"   (claim: {latest['representative_claim'] or '-'})")
     print(f"recorded  : {spent:,} credits, this machine only")
+    print(f"plan      : {plan}, nominal {nominal:,} credits a week")
 
     # recorded/reported only bounds the denominator if the proxy was running
     # for the whole window; otherwise it is missing days, not just machines.
@@ -2018,7 +2039,7 @@ def calibrate(args):
         print(f"\ndenominator >= {floor:,.0f} credits (recorded / reported; a "
               f"floor, since\n  the proxy never sees the whole account)")
         for mult in (1.0, 1.25, 1.5):
-            cap = NOMINAL_WEEKLY * mult
+            cap = nominal * mult
             note = "  <- ruled out by the floor" if cap < floor else ""
             print(f"    {mult:>4}x nominal = {cap:>13,.0f}{note}")
 
@@ -2029,7 +2050,7 @@ def calibrate(args):
         if low <= high:
             print(f"  one constant ratio fits every pair: [{low:.3f}, {high:.3f}]")
             print(f"  -> same numerator, two denominators; at 1.2 that is "
-                  f"{NOMINAL_WEEKLY * 1.5:,.0f} and {NOMINAL_WEEKLY * 1.25:,.0f}")
+                  f"{nominal * 1.5:,.0f} and {nominal * 1.25:,.0f}")
         else:
             print("  no single ratio fits: the meters differ in more than "
                   "their denominator")
@@ -2038,11 +2059,12 @@ def calibrate(args):
         print("\nDENOMINATOR SHIFT")
         for t0, t1, u0, u1, between in shifts:
             gap = (t1 - t0) / 3600
+            cap = args.cap or weekly_cap(t1)
             print(f"  {_local(t0)} -> {_local(t1)} ({gap:.1f}h apart)")
             print(f"    7d {u0 * 100:.0f}% -> {u1 * 100:.0f}% on {between:,} "
                   f"credits of recorded traffic")
             print(f"    denominator moved x{u0 / u1:.3f}  "
-                  f"({args.cap:,.0f} -> {args.cap * u0 / u1:,.0f} if it started there)")
+                  f"({cap:,.0f} -> {cap * u0 / u1:,.0f} if it started there)")
     else:
         print(f"\nno unexplained jump across {examined} sample gaps: the "
               f"denominator has held steady\n  throughout everything recorded.")
@@ -2098,8 +2120,9 @@ def main(argv=None):
     use.set_defaults(func=usage)
 
     cal = add("calibrate", "infer the weekly denominator, flag it changing")
-    cal.add_argument("--cap", type=float, default=PROMO_WEEKLY,
-                     help="denominator believed in force, for the jump test")
+    cal.add_argument("--cap", type=float, default=None,
+                     help="denominator believed in force, for the jump test "
+                          "(default: the plan in force at each jump)")
     cal.set_defaults(func=calibrate)
 
     args = parser.parse_args(argv)
