@@ -422,9 +422,11 @@ def _strict_json(body: bytes):
 
 
 def _utilization(node: dict):
-    """A limit's utilisation is either on it or one level down."""
-    if "utilization" in node:
-        return node["utilization"]
+    """A limit's utilisation is either on it or one level down. limits[]
+    entries call it `percent`; the top-level windows call it `utilization`."""
+    for key in ("utilization", "percent"):
+        if key in node:
+            return node[key]
     for child in node.values():
         if isinstance(child, dict) and "utilization" in child:
             return child["utilization"]
@@ -1781,12 +1783,17 @@ def status(args):
         print(f"\nDENOMINATOR SHIFT {_local(t1)}: 7d jumped {u0 * 100:.0f}% -> "
               f"{u1 * 100:.0f}% on traffic that cannot explain it; the weekly "
               f"cap moved x{u0 / u1:.2f}.  See `proxy.py calibrate`.")
-    _print_claude_usage(args.db)
+    _print_claude_usage(args.db, signal_ts=row["ts"])
     return 0
 
 
-def _print_claude_usage(db: Path):
-    """The latest claude.ai usage row, if the extension has ever sent one."""
+USAGE_STALE_AFTER = 86400  # seconds of signal with no claude.ai snapshot
+
+
+def _print_claude_usage(db: Path, signal_ts: int | None = None):
+    """The latest claude.ai usage row, if the extension has ever sent one.
+    With `signal_ts`, the latest header row's time, flags snapshots that
+    stopped while traffic went on: the extension is gone or failing."""
     try:
         # closing(), not the connection's own `with`, which only commits.
         with contextlib.closing(connect(db, readonly=True)) as conn:
@@ -1796,13 +1803,17 @@ def _print_claude_usage(db: Path):
         return  # older database, table not there yet
     if row is None:
         return
-    meters = [(label, row[column]) for label, column in
+    meters = [(label, row[column], "") for label, column in
               (("5h", "five_h_utilization"), ("7d", "seven_d_utilization"))]
-    meters += [(f"7d {name}", share) for name, share in
+    # A model-scoped weekly meter runs against half the weekly cap.
+    meters += [(f"7d {name}", share, " (of half the weekly cap)") for name, share in
                sorted((json.loads(row["scoped"]) if row["scoped"] else {}).items())]
     print(f"\nlatest claude.ai usage ({_local(row['ts'])}): "
-          + "  ".join(f"{label} {share * 100:.0f}%" for label, share in meters
-                      if share is not None))
+          + "  ".join(f"{label} {share * 100:.0f}%{note}"
+                      for label, share, note in meters if share is not None))
+    if signal_ts is not None and signal_ts - row["ts"] > USAGE_STALE_AFTER:
+        print(f"  STALE: no claude.ai usage for {(signal_ts - row['ts']) / 86400:.1f} "
+              f"days of signal; is usage-extension still loaded in Chrome?")
     if not row["breakdown"]:
         return
     # As captured on 23 Sep: rows of {key, display_name, percent}, in the

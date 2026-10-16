@@ -197,6 +197,21 @@ def test_parse_claude_usage_flattens_the_usage_page():
     assert json.loads(row["raw"]) == USAGE_PAYLOAD
 
 
+def test_parse_claude_usage_reads_scoped_meters_from_percent():
+    """limits[] as the page sends it since at least 23 Sep: `percent`, not
+    `utilization`, and a scope that also names a surface."""
+    payload = dict(USAGE_PAYLOAD, limits=[
+        {"group": "session", "kind": "session", "percent": 13, "scope": None},
+        {"group": "weekly", "kind": "weekly_all", "percent": 37, "scope": None},
+        {"group": "weekly", "kind": "weekly_scoped", "percent": 20,
+         "resets_at": "2026-10-20T15:00:00.041117+00:00", "is_active": False,
+         "scope": {"model": {"display_name": "Fable", "id": None}, "surface": None},
+         "severity": "normal"},
+    ])
+    row = proxy.parse_claude_usage(json.dumps(payload).encode(), "org_1")
+    assert json.loads(row["scoped"]) == {"Fable": pytest.approx(0.20)}
+
+
 def test_parse_claude_usage_rejects_unrelated_json():
     assert proxy.parse_claude_usage(b'{"hello": "world"}', "o") is None
     assert proxy.parse_claude_usage(b"[]", "o") is None
@@ -658,6 +673,36 @@ def _surface_line(tmp_path, capsys, breakdown) -> str:
     out = capsys.readouterr().out
     assert "5h 10%  7d 72%" in out
     return next((line for line in out.splitlines() if "by surface" in line), "")
+
+
+def _usage_at(db: Path, ts: int):
+    recorder = proxy.Recorder(db)
+    recorder.start()
+    row = proxy.parse_claude_usage(json.dumps(USAGE_PAYLOAD).encode(), ORG)
+    recorder.claude_usage(dict(row, ts=ts))
+    _settle(recorder)
+
+
+def test_status_flags_a_usage_snapshot_older_than_the_signal(tmp_path, capsys):
+    """A Time Machine restore dropped the unpacked extension and nothing said
+    so for three days. Headers still arriving while snapshots stop is the tell."""
+    _usage_at(tmp_path / "t.db", OBSERVED_TS - 2 * 86400)
+    proxy._print_claude_usage(tmp_path / "t.db", signal_ts=OBSERVED_TS)
+    out = capsys.readouterr().out
+    assert "STALE: no claude.ai usage for 2.0 days of signal" in out
+    assert "usage-extension" in out
+
+
+def test_status_does_not_flag_a_recent_usage_snapshot(tmp_path, capsys):
+    _usage_at(tmp_path / "t.db", OBSERVED_TS - 3600)
+    proxy._print_claude_usage(tmp_path / "t.db", signal_ts=OBSERVED_TS)
+    assert "STALE" not in capsys.readouterr().out
+
+
+def test_status_says_the_fable_meter_is_half_the_week(tmp_path, capsys):
+    _usage_at(tmp_path / "t.db", OBSERVED_TS)
+    proxy._print_claude_usage(tmp_path / "t.db")
+    assert "7d Fable 30% (of half the weekly cap)" in capsys.readouterr().out
 
 
 def test_status_labels_a_surface_by_key_when_it_has_no_display_name(tmp_path, capsys):
