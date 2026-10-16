@@ -27,6 +27,7 @@ import proxy
 def handler_env(tmp_path):
     """Class-level state serve() would normally install on Proxy."""
     proxy.Proxy.recorder = proxy.Recorder(tmp_path / "t.db")  # not started
+    proxy.Proxy.config = proxy.Config(tmp_path / "config.json")  # absent: all off
     proxy.Proxy.upstream = SimpleNamespace(
         stats={"pool_dropped": 0, "pool_stale_timeout": 0})
     proxy.Proxy.started_at = time.monotonic()
@@ -837,3 +838,738 @@ def test_shifts_judge_each_jump_against_the_cap_in_force_then(tmp_path, day, fla
         found, examined = proxy._shifts(conn)
     assert examined == 1
     assert bool(found) is flagged
+
+
+# --------------------------------------------------------------------------- #
+# Prompt logging
+# --------------------------------------------------------------------------- #
+
+def _write_config(path: Path, value) -> None:
+    """Write config.json and push its mtime forward, so a rewrite inside the
+    same filesystem tick still reads as a change."""
+    text = value if isinstance(value, str) else json.dumps(value)
+    path.write_text(text)
+    bump = getattr(_write_config, "bump", 0) + 1
+    _write_config.bump = bump
+    os.utime(path, ns=(time.time_ns() + bump * 1_000_000_000,) * 2)
+
+
+@pytest.fixture
+def config_now(monkeypatch):
+    """Re-stat config.json on every request instead of every couple of seconds."""
+    monkeypatch.setattr(proxy, "CONFIG_RECHECK", 0)
+
+
+def test_config_is_off_when_the_file_is_missing(tmp_path, config_now):
+    config = proxy.Config(tmp_path / "config.json")
+    config.refresh()
+    assert config.prompts.models == ()
+    assert not config.prompts.wants("claude-sonnet-5")
+    assert config.error is None
+
+
+@pytest.mark.parametrize("value", [{}, {"log_prompts": {}}, {"log_prompts": {"models": []}},
+                                   {"other": 1}])
+def test_config_is_off_without_models(tmp_path, config_now, value):
+    path = tmp_path / "config.json"
+    _write_config(path, value)
+    config = proxy.Config(path)
+    config.refresh()
+    assert config.prompts.models == ()
+    assert config.error is None
+
+
+def test_config_matches_exact_names_and_globs(tmp_path, config_now):
+    path = tmp_path / "config.json"
+    _write_config(path, {"log_prompts": {"models": ["claude-sonnet-5", "claude-haiku-*"],
+                                         "max_bytes": 1234}, "future_key": True})
+    config = proxy.Config(path)
+    config.refresh()
+    rules = config.prompts
+    assert rules.models == ("claude-sonnet-5", "claude-haiku-*")
+    assert rules.max_bytes == 1234
+    assert rules.wants("claude-sonnet-5")
+    assert not rules.wants("claude-sonnet-5[1m]"), "exact names match exactly"
+    assert rules.wants("claude-haiku-5-5")
+    assert not rules.wants("claude-opus-5-5")
+    assert not rules.wants(None)
+    assert config.error is None
+
+
+def test_config_star_matches_every_model(tmp_path, config_now):
+    path = tmp_path / "config.json"
+    _write_config(path, {"log_prompts": {"models": ["*"]}})
+    config = proxy.Config(path)
+    config.refresh()
+    assert config.prompts.wants("claude-opus-5-5")
+    assert config.prompts.max_bytes == proxy.PROMPT_MAX_BYTES
+
+
+@pytest.mark.parametrize("bad", [
+    "{not json",
+    "[]",
+    json.dumps({"log_prompts": []}),
+    json.dumps({"log_prompts": {"models": "claude-sonnet-5"}}),  # a string, not a list
+    json.dumps({"log_prompts": {"models": [5]}}),
+    json.dumps({"log_prompts": {"models": ["*"], "max_bytes": 0}}),
+    json.dumps({"log_prompts": {"models": ["*"], "max_bytes": "big"}}),
+    json.dumps({"log_prompts": {"models": ["*"], "max_bytes": True}}),
+])
+def test_bad_config_keeps_the_last_good_one_and_says_why(tmp_path, config_now, capsys, bad):
+    path = tmp_path / "config.json"
+    _write_config(path, {"log_prompts": {"models": ["claude-sonnet-5"]}})
+    config = proxy.Config(path)
+    config.refresh()
+    _write_config(path, bad)
+    config.refresh()
+    assert config.prompts.models == ("claude-sonnet-5",), "last good config kept"
+    assert config.error and str(path) in config.error
+    assert "config" in capsys.readouterr().err
+
+    config.refresh()  # unchanged since: no second complaint
+    assert capsys.readouterr().err == ""
+
+    _write_config(path, {"log_prompts": {"models": ["claude-opus-*"]}})
+    config.refresh()
+    assert config.prompts.models == ("claude-opus-*",)
+    assert config.error is None, "a good config clears the error"
+
+
+def test_bad_config_never_turns_logging_on(tmp_path, config_now):
+    path = tmp_path / "config.json"
+    _write_config(path, json.dumps({"log_prompts": {"models": ["*"], "max_bytes": -1}}))
+    config = proxy.Config(path)
+    config.refresh()
+    assert config.prompts.models == ()
+    assert config.error
+
+
+def test_deleting_the_config_turns_logging_off(tmp_path, config_now):
+    path = tmp_path / "config.json"
+    _write_config(path, {"log_prompts": {"models": ["*"]}})
+    config = proxy.Config(path)
+    config.refresh()
+    path.unlink()
+    config.refresh()
+    assert config.prompts.models == ()
+    assert config.error is None
+
+
+def test_config_is_restated_at_most_once_per_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxy, "CONFIG_RECHECK", 3600)
+    path = tmp_path / "config.json"
+    config = proxy.Config(path)
+    config.refresh()
+    _write_config(path, {"log_prompts": {"models": ["*"]}})
+    config.refresh()
+    assert config.prompts.models == (), "inside the interval nothing is re-read"
+    config.reload()
+    assert config.prompts.models == ("*",), "reload() ignores the interval"
+
+
+def test_sighup_reloads_the_config(tmp_path, monkeypatch):
+    import signal
+    monkeypatch.setattr(proxy, "CONFIG_RECHECK", 3600)
+    path = tmp_path / "config.json"
+    config = proxy.Config(path)
+    config.refresh()
+    _write_config(path, {"log_prompts": {"models": ["*"]}})
+    previous = signal.getsignal(signal.SIGHUP)
+    try:
+        proxy.reload_on_sighup(config)
+        os.kill(os.getpid(), signal.SIGHUP)
+        assert _wait(lambda: config.prompts.models == ("*",))
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+class _MessagesUpstream:
+    """An in-process stand-in for api.anthropic.com: answers every request
+    with a small Messages reply carrying its own request-id, and remembers
+    the bodies it was sent."""
+
+    stats = {"pool_dropped": 0, "pool_stale_timeout": 0}
+
+    def __init__(self, request_id: bool = True):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        outer = self
+        self.bodies: list[bytes] = []
+        self.ids = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                outer.bodies.append(self.rfile.read(int(self.headers["Content-Length"])))
+                outer.ids += 1
+                reply = json.dumps({
+                    "model": "claude-sonnet-5", "stop_reason": "stop_sequence",
+                    "usage": {"input_tokens": 3, "output_tokens": 9,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 70000}}).encode()
+                # Chunked, as api.anthropic.com replies: the relay drops a
+                # Content-Length and would leave the client reading forever.
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if request_id:
+                    self.send_header("request-id", f"req_{outer.ids}")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(b"%X\r\n%s\r\n0\r\n\r\n" % (len(reply), reply))
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, args=(0.01,),
+                         daemon=True).start()
+
+    def send(self, method, path, headers, body):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
+                                          timeout=5)
+        conn.request(method, path, body=body, headers=headers)
+        return conn, conn.getresponse()
+
+    def give_back(self, conn):
+        conn.close()
+
+
+@pytest.fixture
+def prompt_env(plain_server, config_now, tmp_path, monkeypatch):
+    """A running proxy in front of _MessagesUpstream, its recorder started and
+    its config.json at tmp_path/config.json (absent until a test writes it).
+
+    The prompt is queued after the client has its whole response, so `relayed`
+    is released once the handler is done with each request: _send waits on
+    it, and only then is there anything for _settle to wait for."""
+    upstream = _MessagesUpstream()
+    proxy.Proxy.upstream = upstream
+    proxy.Proxy.config = proxy.Config(tmp_path / "config.json")
+    proxy.Proxy.recorder.start()
+    relayed = threading.Semaphore(0)
+    original = proxy.Proxy._relay
+
+    def relay(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            relayed.release()
+
+    monkeypatch.setattr(proxy.Proxy, "_relay", relay)
+    yield SimpleNamespace(port=plain_server.server_address[1], upstream=upstream,
+                          config_path=tmp_path / "config.json",
+                          recorder=proxy.Proxy.recorder, relayed=relayed)
+    upstream.server.shutdown()
+    upstream.server.server_close()
+
+
+def _message(model="claude-sonnet-5", **extra) -> bytes:
+    return json.dumps({"model": model, "max_tokens": 9, "stop_sequences": ["</x>"],
+                       "system": [{"type": "text", "text": "You are a classifier."}],
+                       "messages": [{"role": "user", "content": "hello"}],
+                       **extra}).encode()
+
+
+def _post(port, body: bytes, path="/v1/messages", headers=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", path, body=body,
+                 headers={"Content-Type": "application/json", **(headers or {})})
+    response = conn.getresponse()
+    response.body = response.read()
+    conn.close()
+    return response
+
+
+def _send(env, body: bytes, **kwargs):
+    """_post through prompt_env, returning once the proxy is done with it."""
+    response = _post(env.port, body, **kwargs)
+    assert env.relayed.acquire(timeout=5), "the proxy never finished the request"
+    return response
+
+
+def _prompt_rows(db: Path) -> list:
+    with proxy.connect(db) as conn:
+        return conn.execute("SELECT * FROM prompts ORDER BY id").fetchall()
+
+
+def test_connect_adds_the_prompts_table_to_an_old_database(tmp_path):
+    import sqlite3
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as conn:  # a database from before prompts existed
+        conn.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL)")
+    proxy.connect(db).close()
+    with sqlite3.connect(db) as conn:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(prompts)")}
+    assert {"id", "ts", "request_id", "path", "model", "bytes", "truncated",
+            "encoding", "body"} <= columns
+
+
+def test_a_matching_model_has_its_prompt_stored(prompt_env):
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["claude-sonnet-5"]}})
+    sent = _message()
+    response = _send(prompt_env, sent, path="/v1/messages?beta=true")
+    assert response.status == 200
+    _settle(prompt_env.recorder)
+
+    rows = _prompt_rows(prompt_env.recorder.db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["request_id"] == "req_1"
+    assert row["model"] == "claude-sonnet-5"
+    assert row["path"] == "/v1/messages"
+    assert row["bytes"] == len(sent)
+    assert row["truncated"] == 0
+    assert row["encoding"] == "zlib"
+    assert proxy.prompt_body(row) == sent
+    assert prompt_env.recorder.last_error is None
+
+
+SECRETS = {"Authorization": "Bearer sk-ant-oat01-never-stored",
+           "x-api-key": "sk-ant-api03-never-stored",
+           "Cookie": "sessionKey=never-stored"}
+
+
+def test_request_headers_are_never_stored(prompt_env):
+    """Checked in every column of every prompts row, with the body decoded,
+    and in the raw database and WAL files: in WAL mode a fresh commit sits in
+    -wal, not in the main file."""
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["*"]}})
+    _send(prompt_env, _message(), headers=SECRETS)
+    _settle(prompt_env.recorder)
+
+    db = prompt_env.recorder.db_path
+    raw = b"".join(p.read_bytes() for p in (db, db.with_name(db.name + "-wal"))
+                   if p.exists())
+    rows = _prompt_rows(db)
+    assert len(rows) == 1
+    stored = []
+    for row in rows:
+        for column in row.keys():
+            value = proxy.prompt_body(row) if column == "body" else row[column]
+            stored.append(value if isinstance(value, bytes) else str(value).encode())
+    stored = b"\n".join(stored)
+    for value in SECRETS.values():
+        secret = value.split("=")[-1].split()[-1].encode()
+        assert secret not in stored
+        assert secret not in raw
+
+
+def test_a_prompt_joins_its_requests_row(prompt_env):
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["*"]}})
+    _send(prompt_env, _message())
+    _settle(prompt_env.recorder)
+    with proxy.connect(prompt_env.recorder.db_path) as conn:
+        joined = conn.execute("SELECT r.output_tokens, r.stop_reason FROM prompts p "
+                              "JOIN requests r USING (request_id)").fetchall()
+    assert [tuple(r) for r in joined] == [(9, "stop_sequence")]
+
+
+@pytest.mark.parametrize("body", [
+    _message(model="claude-opus-5-5"),
+    b"not json at all",
+    json.dumps({"messages": []}).encode(),       # no model
+    json.dumps({"model": 5}).encode(),           # not a model name
+    json.dumps(["claude-sonnet-5"]).encode(),
+])
+def test_other_requests_are_not_stored(prompt_env, body):
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["claude-sonnet-*"]}})
+    assert _send(prompt_env, body).status == 200
+    _settle(prompt_env.recorder)
+    assert _prompt_rows(prompt_env.recorder.db_path) == []
+    assert prompt_env.recorder.last_error is None
+
+
+def test_nothing_is_queued_while_logging_is_off(prompt_env, monkeypatch):
+    queued = []
+    monkeypatch.setattr(prompt_env.recorder, "prompt",
+                        lambda *a, **k: queued.append(a))
+    _send(prompt_env, _message())
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": []}})
+    _send(prompt_env, _message())
+    assert queued == []
+
+
+def test_editing_the_config_takes_effect_without_a_restart(prompt_env):
+    _send(prompt_env, _message())                      # no config: off
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["claude-sonnet-5"]}})
+    _send(prompt_env, _message())                      # on
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["claude-haiku-*"]}})
+    _send(prompt_env, _message())                      # sonnet no longer matches
+    _settle(prompt_env.recorder)
+    assert [r["request_id"] for r in _prompt_rows(prompt_env.recorder.db_path)] == ["req_2"]
+
+
+def test_a_long_prompt_is_stored_truncated(prompt_env):
+    _write_config(prompt_env.config_path,
+                  {"log_prompts": {"models": ["*"], "max_bytes": 100}})
+    sent = _message(padding="x" * 5000)
+    _send(prompt_env, sent)
+    _settle(prompt_env.recorder)
+    (row,) = _prompt_rows(prompt_env.recorder.db_path)
+    assert row["bytes"] == len(sent)
+    assert row["truncated"] == 1
+    assert proxy.prompt_body(row) == sent[:100]
+    assert prompt_env.upstream.bodies == [sent], "upstream still gets all of it"
+
+
+def test_a_prompt_without_a_request_id_is_still_stored(prompt_env):
+    upstream = proxy.Proxy.upstream = _MessagesUpstream(request_id=False)
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["*"]}})
+    try:
+        _send(prompt_env, _message())
+    finally:
+        upstream.server.shutdown()
+        upstream.server.server_close()
+    _settle(prompt_env.recorder)
+    (row,) = _prompt_rows(prompt_env.recorder.db_path)
+    assert row["request_id"] is None
+
+
+def test_a_broken_prompt_log_never_breaks_the_response(prompt_env, monkeypatch):
+    _write_config(prompt_env.config_path, {"log_prompts": {"models": ["*"]}})
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(prompt_env.recorder, "prompt", boom)
+    response = _send(prompt_env, _message())
+    assert response.status == 200
+    assert json.loads(response.body)["stop_reason"] == "stop_sequence"
+    assert "disk on fire" in prompt_env.recorder.last_error
+
+
+def test_a_broken_config_check_never_breaks_the_response(prompt_env, monkeypatch):
+    def boom():
+        raise RuntimeError("stat exploded")
+
+    monkeypatch.setattr(proxy.Proxy.config, "refresh", boom)
+    response = _send(prompt_env, _message())
+    assert response.status == 200
+    assert "stat exploded" in prompt_env.recorder.last_error
+
+
+def test_a_prompt_the_recorder_cannot_store_is_dropped_not_raised(tmp_path):
+    recorder = proxy.Recorder(tmp_path / "t.db")
+    recorder.start()
+    recorder.prompt(b"\xff\xfe not json", "/v1/messages", "req_1",
+                    proxy.PromptRules(("*",)))
+    _settle(recorder)
+    assert _prompt_rows(tmp_path / "t.db") == []
+    assert recorder.last_error is None, "a non-JSON body is not an error"
+
+
+def test_queued_prompts_are_capped_in_bytes(tmp_path, monkeypatch):
+    """The queue holds whole bodies; a stalled writer must not let them pile up
+    in memory without bound."""
+    monkeypatch.setattr(proxy, "PROMPT_QUEUE_BYTES", 250)
+    recorder = proxy.Recorder(tmp_path / "t.db")  # not started: nothing drains
+    rules = proxy.PromptRules(("*",))
+    for _ in range(3):
+        recorder.prompt(b"x" * 100, "/v1/messages", None, rules)
+    assert recorder.q.qsize() == 2
+    assert recorder.dropped == 1
+    recorder.start()
+    _settle(recorder)
+    recorder.prompt(b"x" * 100, "/v1/messages", None, rules)
+    assert recorder.q.qsize() <= 1, "budget is given back as prompts are written"
+    assert recorder.dropped == 1
+
+
+def _health(port) -> dict:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/__proxy/health")
+    body = json.load(conn.getresponse())
+    conn.close()
+    return body
+
+
+def test_health_reports_the_prompt_log_in_force(prompt_env):
+    assert _health(prompt_env.port)["prompt_log"] == {
+        "models": [], "max_bytes": proxy.PROMPT_MAX_BYTES, "written": 0, "error": None}
+    _write_config(prompt_env.config_path,
+                  {"log_prompts": {"models": ["claude-sonnet-5"], "max_bytes": 10}})
+    _send(prompt_env, _message())
+    _settle(prompt_env.recorder)
+    assert _health(prompt_env.port)["prompt_log"] == {
+        "models": ["claude-sonnet-5"], "max_bytes": 10, "written": 1, "error": None}
+
+
+def test_health_reports_a_config_that_did_not_load(prompt_env):
+    _write_config(prompt_env.config_path, "{oops")
+    error = _health(prompt_env.port)["prompt_log"]["error"]
+    assert error and "config.json" in error
+
+
+def _quiet_status(monkeypatch, info=None):
+    for name, stub in (("_launchctl", lambda *a: SimpleNamespace(returncode=1, stdout="")),
+                       ("health", lambda port: info), ("hosts_entries", lambda: []),
+                       ("cert_expiry", lambda path: None), ("stale_clients", lambda: []),
+                       ("_listening", lambda port: False)):
+        monkeypatch.setattr(proxy, name, stub)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+
+HEALTH = {"uptime_s": 5, "requests": 1, "errors": 0, "rows_written": 1, "rows_dropped": 0}
+
+
+def _captured(db: Path, *bodies: tuple[bytes, str | None], max_bytes=proxy.PROMPT_MAX_BYTES):
+    recorder = proxy.Recorder(db)
+    recorder.start()
+    for body, request_id in bodies:
+        recorder.prompt(body, "/v1/messages", request_id,
+                        proxy.PromptRules(("*",), max_bytes))
+    _settle(recorder)
+
+
+def test_status_shows_the_prompt_log_when_on(tmp_path, monkeypatch, capsys):
+    _quiet_status(monkeypatch, dict(HEALTH, prompt_log={
+        "models": ["claude-sonnet-5", "claude-haiku-*"], "max_bytes": 100,
+        "written": 1, "error": None}))
+    _captured(tmp_path / "t.db", (_message(), "req_1"), (_message(), "req_2"))
+    proxy.status(SimpleNamespace(port=1, tls_port=1, db=tmp_path / "t.db"))
+    out = capsys.readouterr().out
+    assert "prompts : logging claude-sonnet-5, claude-haiku-* (2 captured)" in out
+
+
+def test_status_is_silent_about_prompts_when_off(tmp_path, monkeypatch, capsys):
+    _quiet_status(monkeypatch, dict(HEALTH, prompt_log={
+        "models": [], "max_bytes": 100, "written": 0, "error": None}))
+    proxy.status(SimpleNamespace(port=1, tls_port=1, db=tmp_path / "t.db"))
+    assert "prompts" not in capsys.readouterr().out
+
+
+def test_status_shows_a_config_error(tmp_path, monkeypatch, capsys):
+    _quiet_status(monkeypatch, dict(HEALTH, prompt_log={
+        "models": [], "max_bytes": 100, "written": 0,
+        "error": "/x/config.json: ValueError: nope"}))
+    proxy.status(SimpleNamespace(port=1, tls_port=1, db=tmp_path / "t.db"))
+    out = capsys.readouterr().out
+    assert "config  : /x/config.json: ValueError: nope" in out
+    assert "last good" in out
+
+
+def test_status_survives_a_database_from_before_prompts(tmp_path, monkeypatch, capsys):
+    import sqlite3
+    db = tmp_path / "old.db"
+    proxy.connect(db).close()
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE prompts")
+    _quiet_status(monkeypatch, dict(HEALTH, prompt_log={
+        "models": ["*"], "max_bytes": 100, "written": 0, "error": None}))
+    assert proxy.status(SimpleNamespace(port=1, tls_port=1, db=db)) == 0
+    assert "prompts : logging * (0 captured)" in capsys.readouterr().out
+
+
+def _request_row(db: Path, request_id: str, output_tokens: int, stop_reason: str):
+    with proxy.connect(db) as conn:
+        conn.execute("INSERT INTO requests (ts, request_id, model, output_tokens, "
+                     "stop_reason) VALUES (?, ?, ?, ?, ?)",
+                     (int(time.time()), request_id, "claude-sonnet-5", output_tokens,
+                      stop_reason))
+
+
+def test_prompts_lists_what_was_captured(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    _captured(db, (_message(), "req_1"), (_message(model="claude-haiku-5-5"), "req_2"),
+              (_message(), None))
+    _request_row(db, "req_1", 9, "stop_sequence")
+    assert proxy.main(["prompts", "--db", str(db)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    first = next(line for line in lines if "req_1" in line)
+    assert "claude-sonnet-5" in first and "9" in first and "stop_sequence" in first
+    assert f"{len(_message())}" in first.replace(",", "")
+    assert any("req_2" in line and "claude-haiku-5-5" in line for line in lines)
+    assert any("-" in line and "claude-sonnet-5" in line and "req_" not in line
+               for line in lines), "a row without a request id is listed too"
+
+
+def test_prompts_filters_by_model_glob_and_limit(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    _captured(db, (_message(), "req_1"), (_message(model="claude-haiku-5-5"), "req_2"),
+              (_message(), "req_3"))
+    proxy.main(["prompts", "--db", str(db), "--model", "claude-son*"])
+    out = capsys.readouterr().out
+    assert "req_1" in out and "req_3" in out and "req_2" not in out
+    proxy.main(["prompts", "--db", str(db), "--limit", "1"])
+    out = capsys.readouterr().out
+    assert "req_3" in out and "req_1" not in out, "the latest N"
+
+
+def test_prompts_shows_the_system_prompt_and_last_messages(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    body = _message(messages=[
+        {"role": "user", "content": "first question, long gone"},
+        {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "tool output"},
+            {"type": "text", "text": "is this turn done?"}]},
+    ])
+    _captured(db, (body, "req_1"))
+    assert proxy.main(["prompts", "--db", str(db), "--request-id", "req_1"]) == 0
+    out = capsys.readouterr().out
+    assert "You are a classifier." in out
+    assert "is this turn done?" in out and "tool output" in out
+    assert "an answer" in out
+    assert "</x>" in out, "stop sequences shown"
+    assert "max_tokens" in out
+
+
+def test_prompts_full_prints_the_whole_body_as_json(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    _captured(db, (_message(), "req_1"))
+    assert proxy.main(["prompts", "--db", str(db), "--request-id", "req_1",
+                       "--full"]) == 0
+    assert json.loads(capsys.readouterr().out) == json.loads(_message())
+
+
+def test_prompts_prints_a_truncated_body_as_text(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    body = _message(padding="x" * 500)
+    _captured(db, (body, "req_1"), max_bytes=60)
+    assert proxy.main(["prompts", "--db", str(db), "--request-id", "req_1"]) == 0
+    out = capsys.readouterr().out
+    assert "truncated" in out
+    assert body[:60].decode() in out
+
+
+def test_prompts_says_when_a_request_id_is_unknown(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    _captured(db, (_message(), "req_1"))
+    assert proxy.main(["prompts", "--db", str(db), "--request-id", "req_9"]) == 1
+    assert "req_9" in capsys.readouterr().err
+
+
+def test_prompts_reads_a_database_from_before_prompts(tmp_path, capsys):
+    import sqlite3
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, ts INTEGER)")
+    assert proxy.main(["prompts", "--db", str(db)]) == 0
+    assert "no prompts captured" in capsys.readouterr().out
+
+
+def test_serve_loads_the_config_and_reloads_it_on_sighup(tmp_path, monkeypatch, capsys):
+    import signal
+    monkeypatch.setattr(proxy, "CONFIG_RECHECK", 3600)
+    path = tmp_path / "config.json"
+    _write_config(path, {"log_prompts": {"models": ["claude-sonnet-5"]}})
+    previous = signal.getsignal(signal.SIGHUP)
+    try:
+        config = proxy.load_config(path)
+        assert config.prompts.models == ("claude-sonnet-5",), "read at startup"
+        assert "logging prompts for claude-sonnet-5" in capsys.readouterr().err
+        _write_config(path, {"log_prompts": {"models": []}})
+        os.kill(os.getpid(), signal.SIGHUP)
+        assert _wait(lambda: config.prompts.models == ())
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+def test_serve_says_nothing_about_prompts_when_off(tmp_path, capsys):
+    import signal
+    previous = signal.getsignal(signal.SIGHUP)
+    try:
+        proxy.load_config(tmp_path / "config.json")
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert capsys.readouterr().err == ""
+
+
+def _head_body(head: dict, tail: bytes) -> bytes:
+    """A JSON object whose first keys are `head`, followed by `tail` verbatim
+    where the rest of the object would be."""
+    return json.dumps(head).encode()[:-1] + b", " + tail
+
+
+@pytest.mark.parametrize("body, model", [
+    (_message(), "claude-sonnet-5"),
+    # Found in the head even though the rest of the body is not JSON at all,
+    # which proves the rest was never parsed.
+    (_head_body({"model": "claude-sonnet-5"}, b'"messages": [{"oops' + b"x" * 200_000),
+     "claude-sonnet-5"),
+    # Not first, but within the head.
+    (_head_body({"max_tokens": 9, "system": "s" * 1000, "model": "claude-sonnet-5"},
+                b'"messages": []}'), "claude-sonnet-5"),
+    # Whitespace JSON allows.
+    (b'{ "stream" : true ,\n  "model"\t:  "claude-sonnet-5" }', "claude-sonnet-5"),
+    # Escapes in the name are decoded, as json would.
+    (b'{"model": "claude-sonnet-5\\u005b1m]"}', "claude-sonnet-5[1m]"),
+    # Only a top-level model counts: one inside a message or a tool input is
+    # data, not the request's model.
+    (_head_body({"messages": [{"role": "user", "content": [
+        {"type": "tool_use", "name": "x", "input": {"model": "claude-sonnet-5"}}]}]},
+        b'"max_tokens": 9}'), None),
+    (b'{"content": "say \\"model\\": \\"claude-sonnet-5\\""}', None),
+    # Past the head: skipped, not found by parsing the whole thing.
+    (_head_body({"messages": "x" * (proxy.PROMPT_HEAD + 10)},
+                b'"model": "claude-sonnet-5"}'), None),
+    (b'{"model": 5}', None),
+    (b'["model", "claude-sonnet-5"]', None),
+    (b"not json", None),
+    (b"\xff\xfe{", None),
+    (b"", None),
+], ids=["first", "tail-not-json", "not-first", "whitespace", "escaped", "tool-input",
+        "inside-a-string", "past-the-head", "not-a-string", "array", "not-json",
+        "not-utf8", "empty"])
+def test_request_model_comes_from_the_head_of_the_body(body, model):
+    assert proxy.request_model(body) == model
+
+
+def test_matching_a_prompt_never_parses_the_whole_body(monkeypatch):
+    """A writer thread json.loads-ing a 4 MB body holds the GIL for tens of
+    milliseconds, stalling every streaming relay meanwhile."""
+    big = _head_body({"model": "claude-sonnet-5"},
+                     b'"messages": "' + b"x" * 4_000_000 + b'"}')
+    real = json.loads
+
+    def loads(text, *args, **kwargs):
+        assert len(text) <= proxy.PROMPT_HEAD, f"parsed {len(text):,} bytes"
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads)
+    row = proxy.prompt_row(1, big, "/v1/messages", None, proxy.PromptRules(("*",)))
+    assert row["model"] == "claude-sonnet-5"
+    assert row["bytes"] == len(big)
+
+
+def test_a_stat_error_is_reported_once_not_every_recheck(tmp_path, config_now, capsys):
+    path = tmp_path / "config.json"
+    _write_config(path, {"log_prompts": {"models": ["claude-sonnet-5"]}})
+    config = proxy.Config(path)
+    config.refresh()
+
+    class Unreadable(type(path)):
+        def stat(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+    config.path = Unreadable(path)
+    for _ in range(3):
+        config.refresh()
+    err = capsys.readouterr().err
+    assert err.count("Permission denied") == 1, err
+    assert "Permission denied" in config.error
+    assert config.prompts.models == ("claude-sonnet-5",), "last good config kept"
+
+    config.path = path  # readable again
+    config.refresh()
+    assert config.error is None
+    config.path = Unreadable(path)
+    config.refresh()
+    assert capsys.readouterr().err.count("Permission denied") == 1, \
+        "the same error after a recovery is news again"
+
+
+def test_an_exact_name_matches_even_with_glob_characters():
+    rules = proxy.PromptRules(("claude-sonnet-5[1m]",))
+    assert rules.wants("claude-sonnet-5[1m]")
+    assert not rules.wants("claude-sonnet-5")
+    assert rules.wants("claude-sonnet-5m"), "for anything else it is still a glob"
+
+
+def test_prompts_filters_by_an_exact_name_with_glob_characters(tmp_path, capsys):
+    db = tmp_path / "t.db"
+    _captured(db, (_message(model="claude-sonnet-5[1m]"), "req_1"),
+              (_message(), "req_2"))
+    proxy.main(["prompts", "--db", str(db), "--model", "claude-sonnet-5[1m]"])
+    out = capsys.readouterr().out
+    assert "req_1" in out and "req_2" not in out

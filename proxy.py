@@ -17,6 +17,10 @@ model-scoped weekly meter and the week's split by surface, which the API
 headers do not carry. The browser extension in usage-extension/ POSTs them to
 /__proxy/claude-usage on the plain listener; nothing on claude.ai is proxied.
 
+A fourth, prompts, is off unless config.json asks for it: whole request bodies
+for the models it names, to see what a mystery request is. The running proxy
+picks up edits to that file without a restart.
+
 Credentials (Authorization / x-api-key / cookies) are forwarded but never
 logged, and only loopback clients are served.
 
@@ -43,6 +47,7 @@ full queue drops samples rather than blocking the proxy.
     uv run proxy.py status                # agent state, health, latest signal
     uv run proxy.py history --days 7      # utilisation over time
     uv run proxy.py usage --days 7        # tokens + credits by model
+    uv run proxy.py prompts               # bodies captured per config.json
 
 The plain-HTTP listener on 127.0.0.1:8787 stays up as a fallback, so
 ANTHROPIC_BASE_URL still works if the intercept is ever backed out.
@@ -52,9 +57,11 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import fnmatch
 import http.client
 import ipaddress
 import json
+import json.scanner
 import math
 import os
 import plistlib
@@ -64,6 +71,7 @@ import resource
 import secrets
 import select
 import shutil
+import signal
 import socket
 import sqlite3
 import ssl
@@ -73,6 +81,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -84,6 +93,7 @@ LABEL = "id.bajanov.claude-ratelimit-proxy"
 DATA_DIR = Path(os.environ.get("CLAUDE_RATELIMIT_DIR",
                                Path.home() / ".claude" / "ratelimit-proxy"))
 DB_PATH = DATA_DIR / "ratelimit.db"
+CONFIG_PATH = DATA_DIR / "config.json"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 SELF = Path(__file__).resolve()
 
@@ -201,6 +211,24 @@ CREATE TABLE IF NOT EXISTS claude_usage (
     raw                   TEXT      -- the whole payload, for what this misses
 );
 CREATE INDEX IF NOT EXISTS claude_usage_ts ON claude_usage(ts);
+
+-- Request bodies for the models config.json names, off unless asked for.
+-- Joins requests on request_id, which is NULL when upstream sent none. The
+-- body is the request as sent, cut at `max_bytes` (truncated = 1) and then
+-- compressed per `encoding`; `bytes` is its size before either. Never headers.
+CREATE TABLE IF NOT EXISTS prompts (
+    id                    INTEGER PRIMARY KEY,
+    ts                    INTEGER NOT NULL,
+    request_id            TEXT,
+    path                  TEXT,
+    model                 TEXT,
+    bytes                 INTEGER,
+    truncated             INTEGER,
+    encoding              TEXT,     -- 'zlib', or 'identity'
+    body                  BLOB
+);
+CREATE INDEX IF NOT EXISTS prompts_ts ON prompts(ts);
+CREATE INDEX IF NOT EXISTS prompts_request_id ON prompts(request_id);
 """
 
 # Response header -> ratelimit column. Anything matching KEEP that is not in
@@ -298,6 +326,9 @@ class Recorder:
         self.last_error: str | None = None
         self._last_signal: tuple | None = None
         self._last_usage: tuple | None = None
+        self.prompts_written = 0
+        self._prompt_bytes = 0  # bodies queued and not yet written
+        self._prompt_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -341,17 +372,43 @@ class Recorder:
         self._last_usage = signal
         self._put(("claude_usage", row))
 
-    def _put(self, item):
+    def prompt(self, body: bytes, path: str, request_id: str | None,
+               rules: PromptRules):
+        """Queue a request body for the prompts table. Whether its model is
+        one `rules` wants is decided on the writer thread, so the request
+        thread never parses or compresses anything."""
+        with self._prompt_lock:
+            if self._prompt_bytes + len(body) > PROMPT_QUEUE_BYTES:
+                self.dropped += 1
+                return
+            self._prompt_bytes += len(body)
+        if not self._put(("prompts", {"ts": int(time.time()), "body": body,
+                                      "path": path, "request_id": request_id,
+                                      "rules": rules})):
+            self._release(body)
+
+    def _release(self, body: bytes):
+        with self._prompt_lock:
+            self._prompt_bytes -= len(body)
+
+    def _put(self, item) -> bool:
         try:
             self.q.put_nowait(item)
+            return True
         except queue.Full:
             self.dropped += 1
+            return False
 
     def _run(self):
         conn = None
         while True:
             table, row = self.q.get()
+            pending = row["body"] if table == "prompts" else None
             try:
+                if pending is not None:
+                    row = prompt_row(**row)
+                    if row is None:
+                        continue  # not a model config.json asked for
                 if conn is None:
                     conn = connect(self.db_path)
                 cols = ", ".join(row)
@@ -370,8 +427,227 @@ class Recorder:
                 except Exception:
                     pass
                 conn = None
+            else:
+                if pending is not None:
+                    self.prompts_written += 1
             finally:
+                if pending is not None:
+                    self._release(pending)
                 self.q.task_done()  # lets tests join the queue instead of sleeping
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+# config.json is read by the running proxy, not just at startup: logging a
+# model's prompts is something you turn on to chase one mystery request and
+# off again, and a restart drops every in-flight session. So the request path
+# re-stats the file, at most once per CONFIG_RECHECK seconds, and re-parses
+# only when it changed. SIGHUP forces the same reload at once.
+CONFIG_RECHECK = 2.0
+# Default cap on a stored prompt, before compression. A full 1M-token context
+# is ~4MB of JSON, so this keeps whole prompts and only stops a runaway.
+PROMPT_MAX_BYTES = 8_000_000
+# Bodies waiting in the recorder's queue, in all. The queue bounds rows, not
+# bytes, and a stalled writer with `"*"` in force would otherwise hold every
+# prompt sent meanwhile in memory.
+PROMPT_QUEUE_BYTES = 64 << 20
+# How much of a body is read to find its model. Only this much is ever parsed:
+# json.loads on a 4MB body holds the GIL for tens of ms, which stalls every
+# streaming relay in the meantime. Claude Code sends `model` first.
+PROMPT_HEAD = 64 << 10
+
+
+class PromptRules(tuple):
+    """`log_prompts` from config.json: model globs, and the per-prompt cap.
+    Immutable, so a request thread holding one never sees half a reload."""
+
+    def __new__(cls, models: tuple[str, ...] = (), max_bytes: int = PROMPT_MAX_BYTES):
+        return super().__new__(cls, (tuple(models), max_bytes))
+
+    models = property(lambda self: self[0])
+    max_bytes = property(lambda self: self[1])
+
+    def wants(self, model) -> bool:
+        # fnmatchcase, so an exact name is just a glob without wildcards and
+        # "claude-sonnet-5" never matches "claude-sonnet-5[1m]".
+        # An exact name is tried first because fnmatch reads `[` as a class:
+        # "claude-sonnet-5[1m]" as a glob would never match itself.
+        return isinstance(model, str) and any(
+            model == pattern or fnmatch.fnmatchcase(model, pattern)
+            for pattern in self.models)
+
+
+def parse_config(text: bytes) -> PromptRules:
+    """The prompt rules in config.json, or ValueError saying what is wrong.
+    Unknown keys are ignored so the file can grow; anything malformed in a key
+    we do read is an error rather than a guess, because a guess could turn
+    logging on."""
+    config = _strict_json(text)
+    if not isinstance(config, dict):
+        raise ValueError("top level is not an object")
+    section = config.get("log_prompts", {})
+    if not isinstance(section, dict):
+        raise ValueError("log_prompts is not an object")
+    models = section.get("models", [])
+    if not isinstance(models, list) or not all(isinstance(m, str) and m for m in models):
+        raise ValueError("log_prompts.models is not a list of model names or globs")
+    max_bytes = section.get("max_bytes", PROMPT_MAX_BYTES)
+    if type(max_bytes) is not int or max_bytes <= 0:  # bool is an int subclass
+        raise ValueError("log_prompts.max_bytes is not a positive integer")
+    return PromptRules(tuple(models), max_bytes)
+
+
+class Config:
+    """config.json as the running proxy sees it.
+
+    A missing file is the default: everything off. A file that will not parse
+    leaves the last good config in force and sets `error`, which health and
+    status report; it is printed to stderr once per change of the file, not
+    once per request.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.prompts = PromptRules()
+        self.error: str | None = None
+        self._stamp: tuple | None = None
+        self._checked = -math.inf
+        # Re-entrant: SIGHUP's handler runs on the main thread, which may be
+        # the one already inside _load (it is in tests, if not in serve).
+        self._lock = threading.RLock()
+
+    def refresh(self):
+        """Cheap enough for the request path: a clock read, and a stat at most
+        every CONFIG_RECHECK seconds. Never raises."""
+        if time.monotonic() - self._checked < CONFIG_RECHECK:
+            return
+        self._load(force=False)
+
+    def reload(self):
+        """Re-read now, whatever the interval or the file's stamp say."""
+        self._load(force=True)
+
+    def _load(self, force: bool):
+        # Non-blocking: if another thread is already reading the file, this
+        # request has no reason to wait for it.
+        if not self._lock.acquire(blocking=force):
+            return
+        # Stays this if the stat fails, so the file is re-read once it can be.
+        stamp: tuple | None = ("unreadable",)
+        try:
+            self._checked = time.monotonic()
+            try:
+                st = self.path.stat()
+                stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+            except FileNotFoundError:
+                stamp = None
+            if stamp == self._stamp and not force:
+                return
+            self._stamp = stamp
+            if stamp is None:
+                self.prompts, self.error = PromptRules(), None
+                return
+            self.prompts, self.error = parse_config(self.path.read_bytes()), None
+        except Exception as exc:  # keep the last good rules
+            # Said once per distinct error. A file that will not parse is only
+            # re-read when it changes, but one that cannot be stat'ed has no
+            # stamp to compare, and would otherwise complain every recheck.
+            self._stamp = stamp
+            error = f"{self.path}: {type(exc).__name__}: {exc}"
+            if error != self.error:
+                sys.stderr.write(f"config not loaded, keeping the last good one: "
+                                 f"{error}\n")
+                sys.stderr.flush()
+            self.error = error
+        finally:
+            self._lock.release()
+
+
+_scan_json = json.scanner.make_scanner(json.JSONDecoder())
+_JSON_SPACE = re.compile(r"[ \t\n\r]*")
+
+
+def request_model(body: bytes) -> str | None:
+    """The top-level `model` of a JSON request body, read from its first
+    PROMPT_HEAD bytes only, or None if it is not there.
+
+    It walks the object's top-level keys with json's own C scanner, which
+    parses one value at a time: so a `model` key inside a message or a tool
+    input is skipped over as part of its parent's value, and whatever comes
+    after the model is never looked at. A value that runs past the head
+    raises, and the body is passed over rather than parsed in full."""
+    head = body[:PROMPT_HEAD].decode("utf-8", errors="replace")
+
+    def skip(pos: int) -> int:
+        return _JSON_SPACE.match(head, pos).end()
+
+    try:
+        pos = skip(0)
+        if head[pos:pos + 1] != "{":
+            return None
+        pos += 1
+        while True:
+            pos = skip(pos)
+            if head[pos:pos + 1] != '"':
+                return None  # `}`: no model at all
+            key, pos = _scan_json(head, pos)
+            pos = skip(pos)
+            if head[pos:pos + 1] != ":":
+                return None
+            value, pos = _scan_json(head, skip(pos + 1))
+            if key == "model":
+                return value if isinstance(value, str) else None
+            pos = skip(pos)
+            if head[pos:pos + 1] != ",":
+                return None
+            pos += 1
+    except (StopIteration, ValueError, RecursionError):
+        return None
+
+
+def prompt_row(ts: int, body: bytes, path: str, request_id: str | None,
+               rules: PromptRules) -> dict | None:
+    """The prompts row for a request body, or None when it is not JSON naming
+    a model the rules want. Runs on the recorder thread."""
+    model = request_model(body)
+    if not rules.wants(model):
+        return None
+    kept = body[:rules.max_bytes]
+    return {"ts": ts, "request_id": request_id, "path": path, "model": model,
+            "bytes": len(body), "truncated": int(len(kept) < len(body)),
+            "encoding": "zlib", "body": zlib.compress(kept, 6)}
+
+
+def prompt_body(row) -> bytes:
+    """A prompts row's body as it was sent (up to any truncation)."""
+    if row["encoding"] == "zlib":
+        return zlib.decompress(row["body"])
+    if row["encoding"] == "identity":
+        return bytes(row["body"])
+    raise ValueError(f"unknown prompt encoding {row['encoding']!r}")
+
+
+def reload_on_sighup(config: Config):
+    """`kill -HUP <pid>` re-reads config.json at once. Without a handler SIGHUP
+    would terminate the proxy, which is the opposite of what anyone sending it
+    wants."""
+    signal.signal(signal.SIGHUP, lambda signum, frame: config.reload())
+
+
+def load_config(path: Path) -> Config:
+    """config.json for serve(): read once now, so a bad file is reported at
+    startup and a capture is announced in the launchd log, then kept fresh
+    by the request path and SIGHUP."""
+    config = Config(path)
+    config.reload()
+    reload_on_sighup(config)
+    if config.prompts.models:
+        print(f"logging prompts for {', '.join(config.prompts.models)} "
+              f"(max {config.prompts.max_bytes:,} bytes each)",
+              file=sys.stderr, flush=True)
+    return config
 
 
 # --------------------------------------------------------------------------- #
@@ -1161,6 +1437,7 @@ class Proxy(BaseHTTPRequestHandler):
 
     recorder: Recorder
     upstream: Upstream
+    config: Config
     started_at: float
     counters: dict
     verbose: bool
@@ -1193,12 +1470,26 @@ class Proxy(BaseHTTPRequestHandler):
             "last_write_error": self.recorder.last_error,
             "fds": open_fds(),
             "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0],
+            "prompt_log": self._prompt_log(),
         }, indent=2).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _prompt_log(self) -> dict | None:
+        """config.json's prompt rules as this process holds them, which is
+        what `status` has to show: an edit that failed to load is invisible
+        in the file itself."""
+        try:
+            self.config.refresh()
+            rules = self.config.prompts
+            return {"models": list(rules.models), "max_bytes": rules.max_bytes,
+                    "written": self.recorder.prompts_written,
+                    "error": self.config.error}
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
 
     def _refuse(self, code: int, **headers: str):
         """A bodiless 4xx that closes the connection, since whatever body the
@@ -1312,11 +1603,11 @@ class Proxy(BaseHTTPRequestHandler):
             return
 
         try:
-            self._relay(conn, response, started)
+            self._relay(conn, response, started, body)
         finally:
             pass
 
-    def _relay(self, conn, response, started: float):
+    def _relay(self, conn, response, started: float, body: bytes | None = None):
         content_length = response.getheader("Content-Length")
         chunked = content_length is None
 
@@ -1373,16 +1664,31 @@ class Proxy(BaseHTTPRequestHandler):
             _close(conn)
 
         try:
-            self._record(response, sniffer, started)
+            self._record(response, sniffer, started, body)
         except Exception as exc:
             self.recorder.last_error = f"record: {type(exc).__name__}: {exc}"
 
-    def _record(self, response, sniffer: UsageSniffer, started: float):
+    def _log_prompt(self, body: bytes | None, request_id: str | None):
+        """Hand the request body to the recorder if config.json asks for any
+        prompts at all; which ones is the recorder's business. After the
+        relay, so the client never waits on any of this, and then only a
+        clock read, the odd stat and a queue put."""
+        try:
+            self.config.refresh()
+            rules = self.config.prompts
+            if body and rules.models:
+                self.recorder.prompt(body, self.path.split("?")[0], request_id, rules)
+        except Exception as exc:
+            self.recorder.last_error = f"prompt: {type(exc).__name__}: {exc}"
+
+    def _record(self, response, sniffer: UsageSniffer, started: float,
+                body: bytes | None = None):
         signal = {name: value for name, value in response.getheaders()
                   if KEEP.search(name) and not SECRET.search(name)}
         request_id = response.getheader("request-id")
         if signal:
             self.recorder.ratelimit(signal, request_id)
+        self._log_prompt(body, request_id)
 
         sniffer.finish()
         if sniffer.model or request_id:
@@ -1509,6 +1815,7 @@ def serve(args):
           f"(via {', '.join(resolver.servers)})", file=sys.stderr, flush=True)
 
     Proxy.recorder = recorder
+    Proxy.config = load_config(CONFIG_PATH)
     Proxy.upstream = Upstream(UPSTREAM_HOST, timeout=args.timeout, resolver=resolver)
     Proxy.started_at = time.monotonic()
     Proxy.counters = {"requests": 0, "errors": 0}
@@ -1737,6 +2044,7 @@ def status(args):
             print(f"fds     : {fds} of {limit} open{warn}")
         if info.get("last_write_error"):
             print(f"          last write error: {info['last_write_error']}")
+        _print_prompt_log(info.get("prompt_log"), args.db)
 
     entries = hosts_entries()
     print(f"hosts   : {UPSTREAM_HOST} -> {', '.join(entries) if entries else 'NOT intercepted'}")
@@ -1789,6 +2097,28 @@ def status(args):
               f"cap moved x{u0 / u1:.2f}.  See `proxy.py calibrate`.")
     _print_claude_usage(args.db, signal_ts=row["ts"])
     return 0
+
+
+def _prompt_count(db: Path) -> int:
+    """Rows in prompts, 0 for a database that predates the table."""
+    try:
+        with connect(db, readonly=True) as conn:
+            return conn.execute("SELECT COUNT(*) c FROM prompts").fetchone()["c"]
+    except sqlite3.Error:
+        return 0
+
+
+def _print_prompt_log(log: dict | None, db: Path):
+    """Prompt logging as the running proxy has it, said only when it is on or
+    config.json failed to load: when off it is the default, not news."""
+    if not log:
+        return
+    if log.get("error"):
+        print(f"config  : {log['error']}\n"
+              f"          not loaded; the last good config is still in force")
+    if log.get("models"):
+        print(f"prompts : logging {', '.join(log['models'])} "
+              f"({_prompt_count(db)} captured)")
 
 
 USAGE_STALE_AFTER = 86400  # seconds of signal with no claude.ai snapshot
@@ -1893,6 +2223,131 @@ def usage(args):
         print(f"  {model:<26} {agg[1]:>12,} cr  n {agg[0]:>5}  in {agg[2]:>10,}  "
               f"cw {agg[3]:>11,}  out {agg[4]:>9,}  cr-read {agg[5]:>12,}{unpriced}")
     print(f"\n  TOTAL: {sum(a[1] for a in per.values()):,} credits")
+    return 0
+
+
+PROMPT_PREVIEW = 2000  # characters of each block the default view shows
+PROMPT_TAIL = 3  # messages the default view shows, counting back from the last
+
+
+def _clip(text: str) -> str:
+    if len(text) <= PROMPT_PREVIEW:
+        return text
+    return f"{text[:PROMPT_PREVIEW]}... [{len(text) - PROMPT_PREVIEW:,} more chars]"
+
+
+def _blocks(content) -> list[str]:
+    """A system prompt or message content, one string per block. Text is
+    shown, clipped; anything else by its type and the gist of it."""
+    if isinstance(content, str):
+        return [_clip(content)]
+    if not isinstance(content, list):
+        return [_clip(json.dumps(content))]
+    out = []
+    for block in content:
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text":
+            out.append(_clip(str(block.get("text", ""))))
+        elif kind == "tool_use":
+            out.append(f"[tool_use {block.get('name')}] "
+                       + _clip(json.dumps(block.get("input"))))
+        elif kind == "tool_result":
+            inner = block.get("content")
+            out.append("[tool_result] " + " / ".join(_blocks(inner) if inner else []))
+        elif kind in ("thinking", "redacted_thinking"):
+            out.append(f"[{kind}]")
+        else:
+            out.append(f"[{kind}]" if kind else _clip(json.dumps(block)))
+    return out
+
+
+def _print_prompt(request: dict):
+    """The parts of a Messages request that say what it is for: its settings,
+    the system prompt in full, and how the conversation ends."""
+    settings = {k: v for k, v in request.items() if k not in ("system", "messages", "tools")}
+    for key, value in settings.items():
+        print(f"{key}: {json.dumps(value)}")
+    tools = request.get("tools")
+    if tools:
+        names = [t.get("name") for t in tools if isinstance(t, dict)]
+        print(f"tools: {len(tools)} ({', '.join(map(str, names))})")
+    if "system" in request:
+        print("\n--- system ---")
+        for text in _blocks(request["system"]):
+            print(text)
+    messages = request.get("messages")
+    if isinstance(messages, list):
+        skipped = max(0, len(messages) - PROMPT_TAIL)
+        print(f"\n--- messages: {len(messages)}"
+              + (f", the last {PROMPT_TAIL} shown" if skipped else "") + " ---")
+        for index, message in enumerate(messages[skipped:], start=skipped):
+            if not isinstance(message, dict):
+                continue
+            print(f"\n[{index}] {message.get('role')}:")
+            for text in _blocks(message.get("content")):
+                print(f"  {text}")
+
+
+def prompts(args):
+    """The prompts config.json had captured, or one of them in full."""
+    if not args.db.exists():
+        print("no database yet", file=sys.stderr)
+        return 1
+    try:
+        with connect(args.db, readonly=True) as conn:
+            if args.request_id or args.id is not None:
+                column, key = (("request_id", args.request_id) if args.request_id
+                               else ("id", args.id))
+                row = conn.execute(f"SELECT * FROM prompts WHERE {column} = ? "
+                                   "ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+                rows = None
+            else:
+                # Newest first, to take the latest N, then turned back round.
+                rows = conn.execute(
+                    "SELECT p.id, p.ts, p.model, p.request_id, p.bytes, p.truncated,"
+                    " r.output_tokens, r.stop_reason FROM prompts p"
+                    " LEFT JOIN requests r ON r.request_id = p.request_id"
+                    " WHERE (p.model = ? OR p.model GLOB ?) ORDER BY p.id DESC LIMIT ?",
+                    (args.model, args.model, args.limit)).fetchall()[::-1]
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        print("no prompts captured: this database predates prompt logging")
+        return 0
+
+    if rows is not None:
+        if not rows:
+            print("no prompts captured"
+                  + ("" if args.model == "*" else f" for {args.model}"))
+            return 0
+        print(f"{'id':>5}  {'when':<16} {'model':<24} {'request id':<32} "
+              f"{'bytes':>11} {'out':>6}  stop")
+        for r in rows:
+            out = "-" if r["output_tokens"] is None else f"{r['output_tokens']:,}"
+            cut = "  (truncated)" if r["truncated"] else ""
+            print(f"{r['id']:>5}  {_local(r['ts']):<16} {r['model'] or '-':<24} "
+                  f"{r['request_id'] or '-':<32} {r['bytes']:>11,} {out:>6}  "
+                  f"{r['stop_reason'] or '-'}{cut}")
+        return 0
+
+    if row is None:
+        print(f"no prompt captured for {args.request_id or f'id {args.id}'}",
+              file=sys.stderr)
+        return 1
+    body = prompt_body(row)
+    print(f"# {row['model']}  {row['path']}  {_local(row['ts'])}  "
+          f"request {row['request_id'] or '-'}  {row['bytes']:,} bytes"
+          + (f", truncated to {len(body):,}" if row["truncated"] else ""),
+          file=sys.stderr if args.full else sys.stdout)
+    try:
+        request = _strict_json(body)
+    except ValueError:  # cut short, most likely: show what there is
+        print(body.decode("utf-8", errors="replace"))
+        return 0
+    if args.full or not isinstance(request, dict):
+        print(json.dumps(request, indent=2, ensure_ascii=False))
+    else:
+        _print_prompt(request)
     return 0
 
 
@@ -2074,7 +2529,7 @@ def calibrate(args):
 # --------------------------------------------------------------------------- #
 
 COMMANDS = ("serve", "install", "uninstall", "status", "history", "usage",
-            "calibrate", "cert", "trust")
+            "prompts", "calibrate", "cert", "trust")
 
 
 def main(argv=None):
@@ -2118,6 +2573,15 @@ def main(argv=None):
     use = add("usage", "tokens and credits by model")
     use.add_argument("--days", type=float, default=7)
     use.set_defaults(func=usage)
+
+    logged = add("prompts", "request bodies captured for the models config.json names")
+    logged.add_argument("--model", default="*", help="model name or glob to list")
+    logged.add_argument("--limit", type=int, default=50, help="list the latest N")
+    logged.add_argument("--request-id", help="show the prompt for this request")
+    logged.add_argument("--id", type=int, help="show the prompt with this row id")
+    logged.add_argument("--full", action="store_true",
+                        help="with --request-id/--id: the whole body as JSON")
+    logged.set_defaults(func=prompts)
 
     cal = add("calibrate", "infer the weekly denominator, flag it changing")
     cal.add_argument("--cap", type=float, default=None,

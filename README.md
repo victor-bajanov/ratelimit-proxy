@@ -87,6 +87,7 @@ profile. Leaving it set defeats the entire exercise.
 uv run proxy.py status              # launchd state, health, intercept, latest signal
 uv run proxy.py history --days 7    # utilisation over time
 uv run proxy.py usage --days 7      # tokens + credits by model
+uv run proxy.py prompts             # request bodies captured, if config.json asks
 uv run proxy.py cert                # renew the leaf (automatic at startup too)
 uv run proxy.py serve               # foreground, for debugging
 uv run proxy.py uninstall
@@ -189,6 +190,65 @@ latest claude.ai usage (Wed 23 Sep 15:40): 5h …%  7d …%  7d <model> …%
   this week by surface: Claude Code 79%, Chats 2%, Cowork 19%, Other 0%
 ```
 
+## Capturing prompts
+
+To find out what a request actually *is*, say a background call nobody can
+explain, the proxy can keep the full request body for chosen models. It is off
+by default. Turn it on in `~/.claude/ratelimit-proxy/config.json` (next to the
+database; `CLAUDE_RATELIMIT_DIR` moves both):
+
+```json
+{"log_prompts": {"models": ["claude-sonnet-5"], "max_bytes": 8000000}}
+```
+
+* `models` holds exact model names or globs (`"claude-haiku-*"`, `"*"` for
+  everything). Globs are Python's `fnmatch`, so `[` opens a character class;
+  a pattern that equals the model name exactly always matches, so
+  `"claude-sonnet-5[1m]"` still means that name. The model is the request
+  body's top-level `model` field, i.e. the name the client asked for
+  (`claude-sonnet-5[1m]` is not `claude-sonnet-5`). Only the first 64 KiB of a
+  body is read to find it, so a big body is never parsed in full on the
+  proxy's time; Claude Code sends `model` first. A body that isn't JSON, or
+  has no `model` in that head, is never kept. An empty list, no `log_prompts`,
+  or no file at all means off.
+* `max_bytes` (default 8,000,000) caps each stored body before compression. A
+  longer one is kept up to the cap and flagged `truncated`; upstream still
+  gets all of it.
+* Other keys are ignored, so the file can grow.
+
+**No restart needed.** The running proxy re-checks the file at most every two
+seconds and re-reads it when it changes; `kill -HUP <pid>` reloads at once. A
+file that won't parse, or has a wrong-typed value, is not applied: the last good
+config stays in force (so a typo never turns logging on), the error goes to
+the launchd log once, and `status` shows it until the file is fixed. Deleting
+the file turns logging off.
+
+`status` says when capture is on:
+
+```
+prompts : logging claude-sonnet-5 (14 captured)
+```
+
+and `prompts` reads them back:
+
+```
+uv run proxy.py prompts                          # the latest 50, joined to requests
+uv run proxy.py prompts --model 'claude-son*' --limit 10
+uv run proxy.py prompts --request-id req_011C…   # settings, system prompt, last 3 messages
+uv run proxy.py prompts --request-id req_011C… --full | jq .   # the whole body
+```
+
+`--model` takes an exact name or the same kind of glob (SQLite `GLOB`). The
+list shows each request's output tokens and stop reason when its
+`requests` row exists. Use `--id N` for a row with no request id.
+
+**Privacy.** A captured body is everything that was sent to the model: the
+system prompt, the whole conversation, file contents, tool output. It is
+stored only in the local database and never leaves the machine, but it stays
+there until you delete it (`DELETE FROM prompts`). Request headers, which carry
+the credentials, are never stored. Turn capture on for the narrowest model
+list that answers the question, and off again afterwards.
+
 ## Data
 
 `~/.claude/ratelimit-proxy/ratelimit.db`, WAL mode, safe to read while the
@@ -212,7 +272,14 @@ by the extension: org, 5h and 7d utilisation and resets (fractions, like
 weekly meters in `scoped`, `seven_day_breakdown` verbatim in `breakdown`, and
 the whole payload in `raw` so a shape change loses nothing.
 
-All three are plain SQLite, so ad-hoc questions don't need this tool:
+**`prompts`** — only when `config.json` asks for it (see above): one row per
+captured request body, with `request_id` to join `requests`, `path`, `model`,
+`bytes` (the size sent), `truncated`, and the body itself as a BLOB compressed
+per `encoding` (`zlib`; `python -c 'import zlib,sys;
+sys.stdout.buffer.write(zlib.decompress(sys.stdin.buffer.read()))'` undoes it).
+A body is kept even when upstream sent no request id; `request_id` is then NULL.
+
+All of them are plain SQLite, so ad-hoc questions don't need this tool:
 
 ```sql
 -- when did the 7d window last cross 80%?
