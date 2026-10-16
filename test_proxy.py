@@ -751,8 +751,11 @@ def test_open_fds_counts_a_new_descriptor(tmp_path):
 
 
 @pytest.mark.parametrize("model, per_mtok_in, per_mtok_out", [
-    ("claude-opus-5-5", 533_334, 2_666_667),    # $4 / $20
+    # $4 / $20 list, metered at 0.58x: fitted 16 Oct 2026 against Mythos
+    # (full list) on the same meters, and against the Fable-scoped meter.
+    ("claude-opus-5-5", 309_334, 1_546_667),
     ("claude-sonnet-5-5", 266_667, 1_333_334),  # $2 / $10
+    ("claude-mythos-5-1", 1_333_334, 6_666_667),  # $10 / $50, as Fable
 ])
 def test_credits_prices_the_5_5_models(model, per_mtok_in, per_mtok_out):
     assert proxy.credits(model, 1_000_000, 0, 0) == per_mtok_in
@@ -785,7 +788,7 @@ def test_credits_between_counts_cache_reads_toward_the_long_prompt_tier(tmp_path
 
 
 def test_credits_ignores_cache_reads_for_untiered_models():
-    assert proxy.credits("claude-opus-5-5", 1_000_000, 0, 0, cache_read=5_000_000) == 533_334
+    assert proxy.credits("claude-opus-5-5", 1_000_000, 0, 0, cache_read=5_000_000) == 309_334
 
 
 if __name__ == "__main__":

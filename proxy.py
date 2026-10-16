@@ -112,9 +112,13 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailers", "transfer-encoding", "upgrade", "host",
        "accept-encoding", "content-length"}
 
-# Credits per Mtok, mirroring sched.py: (input, output).
+# Credits per Mtok, mirroring sched.py: (input, output). API list price,
+# except Opus 5.5: listed at $4/$20 but metered at about 0.58x that, fitted
+# 16 Oct 2026 against Mythos 5.1 (full list, like Fable) on the same meters
+# and against the Fable-scoped meter, which is half the weekly cap.
 PRICE = {"claude-fable-5": (10, 50), "claude-fable-5-1": (10, 50),
-         "claude-opus-5-5": (4, 20), "claude-opus-5": (5, 25),
+         "claude-mythos-5-1": (10, 50),
+         "claude-opus-5-5": (2.32, 11.6), "claude-opus-5": (5, 25),
          "claude-opus-4-8": (5, 25), "claude-opus-4-7": (5, 25),
          "claude-sonnet-5-5": (2, 10), "claude-sonnet-5": (2, 10),
          "claude-sonnet-4-6": (3, 15), "claude-haiku-4-5-20251001": (1, 5),
