@@ -1010,8 +1010,7 @@ class _MessagesUpstream:
                     "usage": {"input_tokens": 3, "output_tokens": 9,
                               "cache_creation_input_tokens": 0,
                               "cache_read_input_tokens": 70000}}).encode()
-                # Chunked, as api.anthropic.com replies: the relay drops a
-                # Content-Length and would leave the client reading forever.
+                # Chunked, as api.anthropic.com's Messages replies are.
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 if request_id:
@@ -1573,3 +1572,260 @@ def test_prompts_filters_by_an_exact_name_with_glob_characters(tmp_path, capsys)
     proxy.main(["prompts", "--db", str(db), "--model", "claude-sonnet-5[1m]"])
     out = capsys.readouterr().out
     assert "req_1" in out and "req_2" not in out
+
+
+# --------------------------------------------------------------------------- #
+# Response framing
+# --------------------------------------------------------------------------- #
+
+class _CannedUpstream:
+    """An upstream that answers its Nth request with replies[N], byte for byte,
+    so a test controls the framing exactly. One request per connection, as
+    the fake send() below opens a fresh one each time. A connection is closed
+    `linger` seconds after its reply (0: at once, as a dying upstream would),
+    and `given_back` lists the connections the proxy returned to the pool."""
+
+    stats = {"pool_dropped": 0, "pool_stale_timeout": 0}
+
+    def __init__(self, replies: list[bytes], linger: float = 2):
+        import socket
+        self.replies = list(replies)
+        self.linger = linger
+        self.given_back: list = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        for reply in self.replies:
+            conn, _ = self.sock.accept()
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += conn.recv(65536)
+            headers, _, body = head.partition(b"\r\n\r\n")
+            for line in headers.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    while len(body) < int(line.split(b":")[1]):
+                        body += conn.recv(65536)
+            conn.sendall(reply)
+            if self.linger:
+                threading.Timer(self.linger, conn.close).start()  # keep-alive
+            else:
+                conn.close()
+
+    def send(self, method, path, headers, body):
+        conn = http.client.HTTPConnection("127.0.0.1", self.sock.getsockname()[1],
+                                          timeout=5)
+        conn.request(method, path, body=body, headers=headers)
+        return conn, conn.getresponse()
+
+    def give_back(self, conn):
+        self.given_back.append(conn)
+        conn.close()
+
+
+OK_AFTER = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 11\r\n\r\n{\"next\": 1}")
+
+
+def _keepalive_pair(port, first: tuple, second: tuple = ("POST", "/v1/messages")):
+    """Two requests on one client connection with a short read timeout: the
+    first response, then the second, which only arrives intact if the first
+    was framed exactly."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    method, path = first
+    conn.request(method, path, body=b"{}" if method == "POST" else None)
+    response = conn.getresponse()
+    body = response.read()
+    sock = conn.sock
+    conn.request(*second, body=b"{}")
+    after = conn.getresponse()
+    after_body = after.read()
+    assert conn.sock is sock, "the client had to reconnect"
+    conn.close()
+    return response, body, after, after_body
+
+
+def test_a_fixed_length_reply_keeps_its_content_length(plain_server):
+    """Content-Length used to be dropped with nothing put in its place, so a
+    non-chunked reply had no framing at all on a keep-alive connection and the
+    client sat waiting for a close that never came."""
+    reply = b'{"input_tokens": 12}'
+    proxy.Proxy.upstream = _CannedUpstream([
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Content-Length: %d\r\n\r\n%s" % (len(reply), reply), OK_AFTER])
+    response, body, after, after_body = _keepalive_pair(
+        plain_server.server_address[1], ("POST", "/v1/messages/count_tokens"))
+    assert body == reply
+    assert response.getheader("Content-Length") == str(len(reply))
+    assert response.getheader("Transfer-Encoding") is None
+    assert after_body == b'{"next": 1}'
+
+
+def test_a_chunked_reply_with_a_content_length_too_is_relayed_chunked(plain_server):
+    """Transfer-Encoding wins over Content-Length (RFC 9112 6.3), and the relay
+    re-chunks what it reads, so the stale length must not go along with it."""
+    proxy.Proxy.upstream = _CannedUpstream([
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 999\r\n\r\n"
+        b"5\r\nhello\r\n0\r\n\r\n", OK_AFTER])
+    response, body, after, after_body = _keepalive_pair(
+        plain_server.server_address[1], ("POST", "/v1/messages"))
+    assert body == b"hello"
+    assert response.getheader("Content-Length") is None
+    assert after_body == b'{"next": 1}'
+
+
+def _raw_pair(port, first: bytes) -> tuple[bytes, bytes]:
+    """Send `first` and then a POST on one raw socket; return the first
+    response's head and every byte that follows it. A client that knows the
+    first response has no body reads the next one from right there, so stray
+    bytes in between are a corrupted stream to it."""
+    import socket
+    sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+    sock.sendall(first)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        data += sock.recv(65536)
+    head, _, rest = data.partition(b"\r\n\r\n")
+    sock.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+    try:
+        while not rest.endswith(b'{"next": 1}'):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            rest += chunk
+    except TimeoutError:
+        pass
+    sock.close()
+    return head, rest
+
+
+@pytest.mark.parametrize("status", [b"204 No Content", b"304 Not Modified"])
+def test_a_bodiless_status_is_relayed_without_a_body(plain_server, status):
+    proxy.Proxy.upstream = _CannedUpstream([b"HTTP/1.1 " + status + b"\r\n\r\n", OK_AFTER])
+    head, rest = _raw_pair(plain_server.server_address[1],
+                           b"POST /v1/files/x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+    assert head.startswith(b"HTTP/1.1 " + status)
+    assert b"transfer-encoding" not in head.lower()
+    assert rest.startswith(b"HTTP/1.1 200"), rest[:40]
+    assert rest.endswith(b'{"next": 1}')
+
+
+@pytest.mark.parametrize("length", [b"Content-Length: 42\r\n", b""])
+def test_a_head_reply_is_relayed_without_a_body(plain_server, length):
+    proxy.Proxy.upstream = _CannedUpstream([
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" + length + b"\r\n",
+        OK_AFTER])
+    head, rest = _raw_pair(plain_server.server_address[1],
+                           b"HEAD /v1/models HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200")
+    if length:
+        assert b"Content-Length: 42" in head, "a HEAD keeps the length of what GET would send"
+    assert b"transfer-encoding" not in head.lower()
+    assert rest.startswith(b"HTTP/1.1 200"), rest[:40]
+
+
+
+def test_a_reply_cut_short_of_its_content_length_closes_the_client(plain_server):
+    """The length has already gone to the client, so a reply that ends early
+    can only be signalled by closing: left open, the client would wait out
+    the listener's 900 s for bytes that are never coming."""
+    upstream = proxy.Proxy.upstream = _CannedUpstream(
+        [b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + b"x" * 40], linger=0)
+    conn = http.client.HTTPConnection("127.0.0.1", plain_server.server_address[1],
+                                      timeout=3)
+    conn.request("POST", "/v1/messages", body=b"{}")
+    response = conn.getresponse()
+    t0 = time.monotonic()
+    with pytest.raises(http.client.IncompleteRead) as cut:
+        response.read()
+    assert time.monotonic() - t0 < 1.5, "the client waited instead of seeing EOF"
+    assert cut.value.partial == b"x" * 40
+    conn.close()
+    assert upstream.given_back == [], "a dead upstream connection went back to the pool"
+
+
+def _raw_until_eof(port, request: bytes, timeout=3) -> tuple[bytes, float]:
+    """Everything the proxy sends for `request` until it closes, and how long
+    that took. A TimeoutError means it never closed."""
+    import socket
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    sock.sendall(request)
+    t0 = time.monotonic()
+    data = b""
+    while chunk := sock.recv(65536):
+        data += chunk
+    sock.close()
+    return data, time.monotonic() - t0
+
+
+def test_an_informational_reply_never_goes_back_to_the_pool(plain_server):
+    """http.client hands back a 103 as if it were the final response, leaving
+    the real one unread on the upstream socket: pooled, that connection would
+    answer the next request with the previous one's reply."""
+    upstream = proxy.Proxy.upstream = _CannedUpstream([
+        b"HTTP/1.1 103 Early Hints\r\nLink: </x>; rel=preload\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", OK_AFTER])
+    port = plain_server.server_address[1]
+    data, took = _raw_until_eof(
+        port, b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+    assert data.startswith(b"HTTP/1.1 103")
+    assert took < 1.5, "the client connection was left open after a 103"
+    assert upstream.given_back == []
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    conn.request("POST", "/v1/messages", body=b"{}")
+    response = conn.getresponse()
+    assert (response.status, response.read()) == (200, b'{"next": 1}')
+    conn.close()
+
+
+def test_a_close_delimited_reply_is_relayed_chunked(plain_server):
+    proxy.Proxy.upstream = _CannedUpstream(
+        [b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello"], linger=0)
+    import socket
+    sock = socket.create_connection(("127.0.0.1", plain_server.server_address[1]),
+                                    timeout=3)
+    sock.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+    data = b""
+    while not data.endswith(b"0\r\n\r\n"):
+        data += sock.recv(65536)
+    sock.close()
+    head, _, rest = data.partition(b"\r\n\r\n")
+    assert b"transfer-encoding: chunked" in head.lower()
+    assert b"connection: close" not in head.lower(), "upstream's hop header stays there"
+    assert rest == b"5\r\nhello\r\n0\r\n\r\n"
+
+
+def test_a_streamed_reply_arrives_whole_and_the_connection_is_reused(plain_server):
+    events = [b"event: message_start\ndata: {}\n\n",
+              b"event: content_block_delta\ndata: {\"text\": \"hi\"}\n\n",
+              b"event: message_delta\ndata: {}\n\n",
+              b"event: message_stop\ndata: {}\n\n"]
+    stream = b"".join(b"%X\r\n%s\r\n" % (len(e), e) for e in events) + b"0\r\n\r\n"
+    proxy.Proxy.upstream = _CannedUpstream([
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n" + stream, OK_AFTER])
+    response, body, after, after_body = _keepalive_pair(
+        plain_server.server_address[1], ("POST", "/v1/messages"))
+    assert response.getheader("Transfer-Encoding") == "chunked"
+    assert response.getheader("Content-Type") == "text/event-stream"
+    assert body == b"".join(events)
+    assert after_body == b'{"next": 1}'
+
+
+def test_an_error_reply_is_relayed_exactly(plain_server):
+    error = (b'{"type":"error","error":{"type":"invalid_request_error",'
+             b'"message":"max_tokens: field required"},"request_id":"req_x"}')
+    proxy.Proxy.upstream = _CannedUpstream([
+        b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+        b"request-id: req_x\r\nContent-Length: %d\r\n\r\n%s" % (len(error), error),
+        OK_AFTER])
+    response, body, after, after_body = _keepalive_pair(
+        plain_server.server_address[1], ("POST", "/v1/messages"))
+    assert response.status == 400
+    assert body == error
+    assert response.getheader("Content-Length") == str(len(error))
+    assert response.getheader("request-id") == "req_x"
+    assert after_body == b'{"next": 1}'

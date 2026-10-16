@@ -121,6 +121,11 @@ KEEP = re.compile(r"(ratelimit|rate-limit|unified|quota|retry-after)", re.I)
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailers", "transfer-encoding", "upgrade", "host",
        "accept-encoding", "content-length"}
+# The same for responses, less content-length: a reply's length is relayed
+# as it came, since the relay copies the body byte for byte. Only a request's
+# is regenerated (by http.client). Dropping it here left a fixed-length reply
+# with no framing at all, and a keep-alive client waiting for a close.
+RESPONSE_HOP = HOP - {"content-length"}
 
 # Credits per Mtok, mirroring sched.py: (input, output). API list price,
 # except Opus 5.5: listed at $4/$20 but metered at about 0.58x that, fitted
@@ -1608,8 +1613,15 @@ class Proxy(BaseHTTPRequestHandler):
             pass
 
     def _relay(self, conn, response, started: float, body: bytes | None = None):
-        content_length = response.getheader("Content-Length")
-        chunked = content_length is None
+        # A reply to HEAD, a 204 or a 304 never has a body, whatever its
+        # headers say (RFC 9112 6.3), so it gets no chunked framing either:
+        # a terminating chunk there would be read as the start of the next
+        # response. Anything else is re-chunked if it came chunked (which wins
+        # over a Content-Length sent alongside) or with no length at all.
+        bodiless = (self.command == "HEAD" or response.status in (204, 304)
+                    or response.status < 200)
+        chunked = not bodiless and (response.chunked
+                                    or response.getheader("Content-Length") is None)
 
         # send_response_only, not send_response: we relay upstream's Date and
         # Server rather than stacking a second copy of each on top of them.
@@ -1617,7 +1629,7 @@ class Proxy(BaseHTTPRequestHandler):
         seen = set()
         for name, value in response.getheaders():
             key = name.lower()
-            if key in HOP or (chunked and key == "content-length"):
+            if key in RESPONSE_HOP or (chunked and key == "content-length"):
                 continue
             seen.add(key)
             self.send_header(name, value)
@@ -1629,6 +1641,11 @@ class Proxy(BaseHTTPRequestHandler):
 
         sniffer = UsageSniffer()
         reusable = True
+        # What a fixed-length reply promised, which the client was told. read1
+        # ends such a body with a quiet b"" when upstream hangs up early, not
+        # an exception, so a short count is the only sign of it.
+        expected = None if chunked or bodiless else response.length
+        relayed = 0
         try:
             while True:
                 # read1, not read: on a chunked body read(n) keeps pulling
@@ -1644,6 +1661,7 @@ class Proxy(BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(chunk)
                 self.wfile.flush()
+                relayed += len(chunk)
                 try:
                     sniffer.feed(chunk)
                 except Exception:
@@ -1657,6 +1675,22 @@ class Proxy(BaseHTTPRequestHandler):
             reusable = False
             self.close_connection = True
             self.log_error("stream %s: %s", self.path, exc)
+
+        if expected is not None and relayed < expected:
+            # The length has gone out already, so closing is the only way
+            # left to tell the client; kept open, it would wait out the
+            # listener's timeout for bytes that are never coming.
+            reusable = False
+            self.close_connection = True
+            self.log_error("stream %s: upstream sent %d of %d bytes",
+                           self.path, relayed, expected)
+        if response.status < 200:
+            # http.client takes only 100 Continue in its stride: anything else
+            # informational (a 103 Early Hints) comes back as if final, with
+            # the real response still unread on the upstream socket, and the
+            # client was sent a 1xx it will never see the end of.
+            reusable = False
+            self.close_connection = True
 
         if reusable and response.isclosed():
             self.upstream.give_back(conn)
