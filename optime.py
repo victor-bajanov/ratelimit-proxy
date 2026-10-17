@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy>=1.26"]
+# dependencies = ["numpy>=1.26", "scipy>=1.11"]
 # ///
 """Operational-time analysis of the plan meters.
 
@@ -70,6 +70,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from scipy import stats
 
 from proxy import DB_PATH, LIST_PRICE, LONG_PROMPT_PRICE, PRICE, connect, credits
 
@@ -263,6 +264,13 @@ class Fit:
     r2: float
     rmse: float
     resid: np.ndarray
+    dof: int = 0
+    p: np.ndarray = field(default_factory=lambda: np.array([]))
+
+
+def p_value(t: float, dof: int) -> float:
+    """Two-sided p for a t statistic on dof degrees of freedom."""
+    return float(2 * stats.t.sf(abs(t), dof))
 
 
 def design(intervals: list[Interval], counters: list[str], by_model: bool):
@@ -294,7 +302,9 @@ def ols(names: list[str], X: np.ndarray, y: np.ndarray) -> Fit:
     cov = sigma2 * np.linalg.pinv(X.T @ X)
     se = np.sqrt(np.clip(np.diag(cov), 0, None))
     r2 = 1 - rss / float(y @ y) if y.any() else float("nan")
-    return Fit(names, beta, se, n, rank, r2, float(np.sqrt(rss / n)), resid)
+    p = np.array([p_value(b / s, dof) if s > 0 else float("nan")
+                  for b, s in zip(beta, se)])
+    return Fit(names, beta, se, n, rank, r2, float(np.sqrt(rss / n)), resid, dof, p)
 
 
 def fit_meter(data: MeterData, counters: list[str], by_model: bool) -> Fit | None:
@@ -329,16 +339,17 @@ def fit_meter_priced(data: MeterData, counters: list[str]) -> Fit | None:
 def report_fit(fit: Fit, data: MeterData):
     base = fit.names.index("input") if "input" in fit.names else None
     b_in = fit.beta[base] if base is not None and fit.beta[base] > 0 else None
-    print(f"  {'counter':<32} {'ticks/Mtok':>11} {'se':>9} {'t':>6} "
+    print(f"  {'counter':<32} {'ticks/Mtok':>11} {'se':>9} {'t':>6} {'p':>9} "
           f"{'tok/tick':>12} {'x input':>8} {'credits()':>9}")
-    for name, b, s in zip(fit.names, fit.beta, fit.se):
+    for name, b, s, pv in zip(fit.names, fit.beta, fit.se, fit.p):
         t = b / s if s > 0 else float("nan")
         per_tick = f"{MTOK / b:>12,.0f}" if b > 0 else f"{'-':>12}"
         rel = f"{b / b_in:>8.2f}" if b_in else f"{'-':>8}"
         counter = name.split(":")[-1]
         assumed = f"{CREDIT_WEIGHTS[counter]:>9.1f}" if base is not None else f"{'-':>9}"
         flag = "  <- negative" if b < 0 else ""
-        print(f"  {name:<32} {b:>11.3f} {s:>9.3f} {t:>6.1f} {per_tick} {rel} {assumed}{flag}")
+        print(f"  {name:<32} {b:>11.3f} {s:>9.3f} {t:>6.1f} {pv:>9.3g} {per_tick} {rel} "
+              f"{assumed}{flag}")
     ticks = sum(iv.delta for iv in data.intervals)
     note = "" if fit.rank == len(fit.names) else f"  RANK DEFICIENT ({fit.rank})"
     print(f"  n={fit.n} intervals, {ticks} ticks, p={len(fit.names)}, "
@@ -349,14 +360,15 @@ def report_priced_fit(fit: Fit, data: MeterData):
     base = fit.names.index("input") if "input" in fit.names else None
     b_in = fit.beta[base] if base is not None and fit.beta[base] > 0 else None
     print("  list-priced token fit (each model's tokens x its list $/Mtok):")
-    print(f"  {'counter':<32} {'ticks/$':>11} {'se':>9} {'t':>6} "
+    print(f"  {'counter':<32} {'ticks/$':>11} {'se':>9} {'t':>6} {'p':>9} "
           f"{'$/tick':>12} {'x input':>8}")
-    for name, b, s in zip(fit.names, fit.beta, fit.se):
+    for name, b, s, pv in zip(fit.names, fit.beta, fit.se, fit.p):
         t = b / s if s > 0 else float("nan")
         per_tick = f"{1 / b:>12,.2f}" if b > 0 else f"{'-':>12}"
         rel = f"{b / b_in:>8.2f}" if b_in else f"{'-':>8}"
         flag = "  <- negative" if b < 0 else ""
-        print(f"  {name:<32} {b:>11.4f} {s:>9.4f} {t:>6.1f} {per_tick} {rel}{flag}")
+        print(f"  {name:<32} {b:>11.4f} {s:>9.4f} {t:>6.1f} {pv:>9.3g} {per_tick} "
+              f"{rel}{flag}")
     note = "" if fit.rank == len(fit.names) else f"  RANK DEFICIENT ({fit.rank})"
     print(f"  n={fit.n} intervals, R2={fit.r2:.3f}, rmse={fit.rmse:.2f} ticks{note}")
 

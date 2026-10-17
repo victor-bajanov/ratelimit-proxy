@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "numpy>=1.26"]
+# dependencies = ["pytest>=8", "numpy>=1.26", "scipy>=1.11"]
 # ///
 """Tests for optime.py.  Run with:  uv run test_optime.py"""
 from __future__ import annotations
@@ -125,6 +125,47 @@ def test_main_prints_a_list_priced_fit(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "list-priced token fit" in out
     assert "ticks/$" in out
+
+
+def test_ols_gives_two_sided_p_values_on_n_minus_rank_dof():
+    # y = x + noise, 12 points, one coefficient: dof 11.
+    x = np.arange(1, 13, dtype=float)
+    noise = np.array([0.3, -0.5, 0.2, 0.4, -0.1, -0.6, 0.5, 0.1, -0.2, 0.3, -0.4, 0.0])
+    fit = optime.ols(["x"], x[:, None], x + noise)
+    from scipy import stats
+    t = fit.beta[0] / fit.se[0]
+    assert fit.dof == 11
+    assert fit.p[0] == pytest.approx(2 * stats.t.sf(abs(t), 11))
+    assert 0 <= fit.p[0] < 1e-6
+
+
+def test_p_value_of_a_known_t():
+    # t = 2 on 10 dof is p = 0.0734 two-sided, from tables.
+    assert optime.p_value(2.0, 10) == pytest.approx(0.0734, abs=1e-4)
+    assert optime.p_value(-2.0, 10) == pytest.approx(0.0734, abs=1e-4)
+
+
+def _noisy(k):
+    return [0.3, -0.2, 0.1, -0.4, 0.2, 0.05, -0.1][k % 7]
+
+
+def test_both_tables_print_a_p_column(capsys):
+    intervals = [_iv([k, 3 * k + 1, 0, 0]) for k in range(1, 8)]
+    for k, iv in enumerate(intervals):
+        iv.lvl1 = iv.dollars[0] * 0.5 + iv.dollars[1] * 0.25 + _noisy(k)
+        iv.tokens = {"m": [int(iv.dollars[0] * 1e6), int(iv.dollars[1] * 1e6), 0, 0]}
+    data = optime.MeterData("5h", intervals=intervals)
+    priced = optime.fit_meter_priced(data, ["input", "output"])
+    optime.report_priced_fit(priced, data)
+    token = optime.fit_meter(data, ["input", "output"], by_model=False)
+    optime.report_fit(token, data)
+    out = capsys.readouterr().out
+    headers = [line for line in out.splitlines() if line.strip().startswith("counter")]
+    assert len(headers) == 2
+    assert all(" p" in h.split(" t ")[1] for h in headers)
+    rows = [line for line in out.splitlines() if line.strip().startswith("input")]
+    shown = f"{priced.p[0]:.3g}"
+    assert shown in rows[0]
 
 
 if __name__ == "__main__":
