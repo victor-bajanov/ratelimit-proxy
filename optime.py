@@ -45,6 +45,12 @@ machine's traffic while the meter counts the whole account, so every beta is
 biased upwards and the implied window cap is a floor; the *ratios* between
 betas are what the fit is good for.
 
+A second fit takes the same form after scaling each model's tokens by its API
+list price (input, cache writes and cache reads at the input price, output at
+the output price), so its betas are ticks per list dollar and one set covers
+every model the plan meters at list. A model metered off list shows up as
+residual there; `--by-model` measures it directly.
+
     uv run optime.py                       # every meter, fit + summary
     uv run optime.py --meter 5h --show     # print the interval table
     uv run optime.py --csv ticks.csv       # dump the dataset
@@ -65,7 +71,7 @@ from pathlib import Path
 
 import numpy as np
 
-from proxy import DB_PATH, PRICE, connect, credits
+from proxy import DB_PATH, LIST_PRICE, LONG_PROMPT_PRICE, PRICE, connect, credits
 
 # meter key -> (utilisation column, reset column, label)
 METERS = {
@@ -86,6 +92,24 @@ CREDIT_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_write": 1.0, "cache_read":
 MTOK = 1_000_000
 
 
+def list_dollars(model: str, inp: int, out: int, cache_write: int,
+                 cache_read: int) -> tuple[float, float, float, float]:
+    """One request's counters in list dollars, in COUNTERS order.
+
+    Input, cache writes and cache reads go at the input price, output at the
+    output price; the API's flat cache multipliers (1.25x, 0.1x) are the same
+    for every model, so the fit's betas absorb them. Unknown models are $0."""
+    price = LIST_PRICE.get(model)
+    if not price:
+        return (0, 0, 0, 0)
+    pin, pout = price
+    tier = LONG_PROMPT_PRICE.get(model)
+    if tier and inp + cache_write + cache_read > tier[0]:
+        pin, pout = tier[1], tier[2]
+    return (inp * pin / MTOK, out * pout / MTOK, cache_write * pin / MTOK,
+            cache_read * pin / MTOK)
+
+
 # --------------------------------------------------------------------------- #
 # Dataset construction
 # --------------------------------------------------------------------------- #
@@ -102,6 +126,8 @@ class Interval:
     # model -> [input, output, cache_write, cache_read]
     tokens: dict[str, list[int]] = field(default_factory=dict)
     credits: int = 0
+    # list dollars per counter, summed over models: [input, output, cw, cr]
+    dollars: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
 
     @property
     def delta(self) -> int:
@@ -110,6 +136,9 @@ class Interval:
     def total(self, counter: str) -> int:
         i = list(COUNTERS).index(counter)
         return sum(v[i] for v in self.tokens.values())
+
+    def list_total(self, counter: str) -> float:
+        return self.dollars[list(COUNTERS).index(counter)]
 
 
 @dataclass
@@ -173,8 +202,11 @@ class Requests:
         hi = int(np.searchsorted(self.ts, iv.t1, side="right"))
         for r in self.rows[lo:hi]:
             counts = iv.tokens.setdefault(r["model"], [0, 0, 0, 0])
-            for k, col in enumerate(COUNTERS.values()):
-                counts[k] += r[col] or 0
+            row = [r[col] or 0 for col in COUNTERS.values()]
+            for k, v in enumerate(row):
+                counts[k] += v
+            for k, v in enumerate(list_dollars(r["model"], *row)):
+                iv.dollars[k] += v
             iv.credits += credits(r["model"], r["input_tokens"] or 0,
                                   r["output_tokens"] or 0,
                                   r["cache_creation_tokens"] or 0,
@@ -276,6 +308,20 @@ def fit_meter(data: MeterData, counters: list[str], by_model: bool) -> Fit | Non
     return ols(names, X, y)
 
 
+def fit_meter_priced(data: MeterData, counters: list[str]) -> Fit | None:
+    """The token fit with each model's tokens scaled to list dollars first:
+    betas are ticks per list dollar, so a model the plan meters at list
+    shares one beta per counter with every other."""
+    if not data.intervals:
+        return None
+    X = np.array([[iv.list_total(c) for c in counters] for iv in data.intervals],
+                 dtype=float)
+    y = np.array([iv.delta for iv in data.intervals], dtype=float)
+    if X.shape[0] <= X.shape[1]:
+        return None
+    return ols(list(counters), X, y)
+
+
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
@@ -297,6 +343,22 @@ def report_fit(fit: Fit, data: MeterData):
     note = "" if fit.rank == len(fit.names) else f"  RANK DEFICIENT ({fit.rank})"
     print(f"  n={fit.n} intervals, {ticks} ticks, p={len(fit.names)}, "
           f"R2={fit.r2:.3f}, rmse={fit.rmse:.2f} ticks{note}")
+
+
+def report_priced_fit(fit: Fit, data: MeterData):
+    base = fit.names.index("input") if "input" in fit.names else None
+    b_in = fit.beta[base] if base is not None and fit.beta[base] > 0 else None
+    print("  list-priced token fit (each model's tokens x its list $/Mtok):")
+    print(f"  {'counter':<32} {'ticks/$':>11} {'se':>9} {'t':>6} "
+          f"{'$/tick':>12} {'x input':>8}")
+    for name, b, s in zip(fit.names, fit.beta, fit.se):
+        t = b / s if s > 0 else float("nan")
+        per_tick = f"{1 / b:>12,.2f}" if b > 0 else f"{'-':>12}"
+        rel = f"{b / b_in:>8.2f}" if b_in else f"{'-':>8}"
+        flag = "  <- negative" if b < 0 else ""
+        print(f"  {name:<32} {b:>11.4f} {s:>9.4f} {t:>6.1f} {per_tick} {rel}{flag}")
+    note = "" if fit.rank == len(fit.names) else f"  RANK DEFICIENT ({fit.rank})"
+    print(f"  n={fit.n} intervals, R2={fit.r2:.3f}, rmse={fit.rmse:.2f} ticks{note}")
 
 
 def report_credit_fit(data: MeterData):
@@ -396,6 +458,9 @@ def main(argv=None) -> int:
         fit = fit_meter(data, counters, args.by_model)
         if fit:
             report_fit(fit, data)
+        priced = fit_meter_priced(data, counters)
+        if priced:
+            report_priced_fit(priced, data)
         report_credit_fit(data)
         if args.show:
             print()

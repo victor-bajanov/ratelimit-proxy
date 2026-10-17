@@ -127,17 +127,19 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 # with no framing at all, and a keep-alive client waiting for a close.
 RESPONSE_HOP = HOP - {"content-length"}
 
-# Credits per Mtok, mirroring sched.py: (input, output). API list price,
-# except Opus 5.5: listed at $4/$20 but metered at about 0.58x that, fitted
-# 16 Oct 2026 against Mythos 5.1 (full list, like Fable) on the same meters
-# and against the Fable-scoped meter, which is half the weekly cap.
-PRICE = {"claude-fable-5": (10, 50), "claude-fable-5-1": (10, 50),
-         "claude-mythos-5-1": (10, 50),
-         "claude-opus-5-5": (2.32, 11.6), "claude-opus-5": (5, 25),
-         "claude-opus-4-8": (5, 25), "claude-opus-4-7": (5, 25),
-         "claude-sonnet-5-5": (2, 10), "claude-sonnet-5": (2, 10),
-         "claude-sonnet-4-6": (3, 15), "claude-haiku-4-5-20251001": (1, 5),
-         "claude-haiku-4-5": (1, 5), "claude-haiku-5-5": (0.1, 0.5)}
+# API list price, $/Mtok: (input, output).
+LIST_PRICE = {"claude-fable-5": (10, 50), "claude-fable-5-1": (10, 50),
+              "claude-mythos-5-1": (10, 50),
+              "claude-opus-5-5": (4, 20), "claude-opus-5": (5, 25),
+              "claude-opus-4-8": (5, 25), "claude-opus-4-7": (5, 25),
+              "claude-sonnet-5-5": (2, 10), "claude-sonnet-5": (2, 10),
+              "claude-sonnet-4-6": (3, 15), "claude-haiku-4-5-20251001": (1, 5),
+              "claude-haiku-4-5": (1, 5), "claude-haiku-5-5": (0.1, 0.5)}
+# Credits per Mtok, mirroring sched.py: list price, except Opus 5.5, metered
+# at about 0.58x list, fitted 16 Oct 2026 against Mythos 5.1 (full list, like
+# Fable) on the same meters and against the Fable-scoped meter, which is half
+# the weekly cap.
+PRICE = {**LIST_PRICE, "claude-opus-5-5": (2.32, 11.6)}
 # Models priced higher once the prompt (input + cache writes + cache reads)
 # passes a size: model -> (prompt tokens, $/Mtok in, $/Mtok out).
 LONG_PROMPT_PRICE = {"claude-haiku-5-5": (100_000, 0.5, 2.5)}

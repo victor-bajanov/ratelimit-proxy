@@ -143,8 +143,17 @@ The script reads whatever the database holds and refits on all of it, so
 rerun it as the history grows. The proxy sees one machine while the meter
 counts the whole account, so absolute coefficients are biased upwards and the
 implied window cap is a floor; the ratios between counters are the robust
-output. A single-coefficient fit on `credits()` is printed alongside as a
-sanity check against the pricing table.
+output. Two more fits are printed alongside:
+
+* a **list-priced token fit**: the same four counters, but each request's
+  tokens are first scaled by its model's API list price (`LIST_PRICE` in
+  `proxy.py`; input, cache writes and cache reads at the input price, output
+  at the output price, Haiku 5.5's long-prompt tier applied per request). The
+  betas are ticks per list dollar, so a Fable hour and a Haiku hour share one
+  set of coefficients. Models the plan meters off list (Opus 5.5 at about
+  0.58x) bias it; `--by-model` measures each model on its own.
+* a single-coefficient fit on `credits()`, as a sanity check against the
+  plan pricing table.
 
 ## What else this catches
 
