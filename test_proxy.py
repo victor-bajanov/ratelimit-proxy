@@ -1829,3 +1829,53 @@ def test_an_error_reply_is_relayed_exactly(plain_server):
     assert response.getheader("Content-Length") == str(len(error))
     assert response.getheader("request-id") == "req_x"
     assert after_body == b'{"next": 1}'
+
+
+@pytest.fixture
+def cert_dir(tmp_path, monkeypatch):
+    """ensure_certs() writing into a scratch directory, never the live one."""
+    d = tmp_path / "tls"
+    monkeypatch.setattr(proxy, "CERT_DIR", d)
+    monkeypatch.setattr(proxy, "CA_KEY", d / "ca.key")
+    monkeypatch.setattr(proxy, "CA_CERT", d / "ca.pem")
+    monkeypatch.setattr(proxy, "LEAF_KEY", d / "leaf.key")
+    monkeypatch.setattr(proxy, "LEAF_CERT", d / "leaf.pem")
+    proxy.ensure_certs()
+    return d
+
+
+def _verify(ca: Path, cert: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([proxy.OPENSSL, "verify", "-CAfile", str(ca), str(cert)],
+                          capture_output=True, text=True)
+
+
+def _sign_with_ca(d: Path, host: str) -> Path:
+    """A server cert for `host`, signed by our CA as a stolen key could."""
+    key, csr, crt, ext = (d / f"{host}.{s}" for s in ("key", "csr", "pem", "cnf"))
+    ext.write_text(f"[v3]\nsubjectAltName = DNS:{host}\n")
+    subprocess.run([proxy.OPENSSL, "req", "-new", "-newkey", "ec",
+                    "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                    "-keyout", str(key), "-out", str(csr), "-subj", f"/CN={host}"],
+                   check=True, capture_output=True)
+    subprocess.run([proxy.OPENSSL, "x509", "-req", "-in", str(csr),
+                    "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
+                    "-CAcreateserial", "-CAserial", str(d / "ca.srl"),
+                    "-days", "1", "-out", str(crt), "-extfile", str(ext),
+                    "-extensions", "v3"],
+                   check=True, capture_output=True)
+    return crt
+
+
+def test_the_ca_still_vouches_for_its_own_leaf(cert_dir):
+    result = _verify(cert_dir / "ca.pem", cert_dir / "leaf.pem")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_ca_cannot_vouch_for_any_other_site(cert_dir):
+    # The CA sits in the System keychain as a trusted root. Name constraints
+    # keep a leaked ca.key from minting a cert the machine would accept for,
+    # say, a bank.
+    forged = _sign_with_ca(cert_dir, "www.example.com")
+    result = _verify(cert_dir / "ca.pem", forged)
+    assert result.returncode != 0
+    assert "permitted subtree violation" in result.stdout + result.stderr

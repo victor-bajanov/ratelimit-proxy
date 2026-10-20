@@ -1031,6 +1031,9 @@ O = claude-ratelimit-proxy
 basicConstraints = critical, CA:TRUE, pathlen:0
 keyUsage = critical, keyCertSign, cRLSign
 subjectKeyIdentifier = hash
+# A trusted root that could sign for any name is a standing risk if ca.key
+# leaks, so the CA is only good for the names the leaf carries.
+nameConstraints = critical, permitted;DNS:{UPSTREAM_HOST}, permitted;DNS:localhost, permitted;IP:127.0.0.1/255.255.255.255, permitted;IP:::1/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 """
 
 LEAF_CONFIG = f"""
