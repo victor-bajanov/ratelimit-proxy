@@ -1,4 +1,4 @@
-# claude-ratelimit-proxy
+# ratelimit-proxy
 
 A localhost proxy that sits in front of `api.anthropic.com` and records the
 `anthropic-ratelimit-unified-*` response headers to SQLite.
@@ -13,6 +13,32 @@ It also sniffs per-request model and token counts out of the response stream,
 which gives you the same numbers a transcript parser would derive, without
 the transcript-parsing caveats (no duplicate `message.id` rows, no
 `<synthetic>` entries, no missing requests).
+
+## Before you run it
+
+This is an unofficial personal tool. It is not affiliated with or endorsed by
+Anthropic.
+
+It only observes your own traffic, on your own machine:
+
+* requests and responses pass through unmodified, and it sends no requests of
+  its own to `api.anthropic.com`
+* credentials are forwarded but never written down; request headers are never
+  stored, even when prompt capture is on
+* nothing lets another person, client or service use your subscription
+* it measures the plan limits; it does not raise, bypass or work around them
+
+Even so, intercepting your own Claude traffic may conflict with Anthropic's
+terms, and those terms change. Anthropic can act on an account at its
+discretion. Read the [Consumer Terms](https://www.anthropic.com/legal/consumer-terms),
+the [Usage Policy](https://www.anthropic.com/legal/aup) and Claude Code's
+[legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)
+page, and decide for yourself. Use it at your own risk.
+
+It also asks you to trust a local root CA machine-wide. The CA is
+name-constrained to `api.anthropic.com` and localhost, so even a leaked
+`ca.key` can't mint a certificate your machine would accept for any other
+site. `uninstall` prints how to remove the CA and the hosts entry.
 
 ## How it gets into the path
 
@@ -175,6 +201,13 @@ server certificates even under a locally added root. `serve` reissues it
 automatically once it is within 30 days of expiry; the CA is untouched, so the
 keychain trust survives.
 
+The CA carries critical name constraints: it can only vouch for
+`api.anthropic.com`, `localhost`, `127.0.0.1` and `::1`. A CA created before
+that change has none, and nothing replaces it on its own. To swap it, run
+`uv run proxy.py cert --force`, delete the old CA from the keychain (`cert`
+prints the command), trust the new one as in Install, and restart the proxy
+and every client that predates the new CA.
+
 ## claude.ai usage by surface
 
 The API headers give one 7d number for the whole account. claude.ai's usage
@@ -185,6 +218,13 @@ claude.ai page fetches its usage JSON, the extension re-fetches it with the
 browser's cookies and POSTs it to `POST /__proxy/claude-usage` on the plain
 listener. The proxy never relays claude.ai traffic; this endpoint only receives
 what the extension sends.
+
+The extension is optional, and it is the one part that makes a request of its
+own: a single GET of the same usage JSON, with your own session, right after
+claude.ai has fetched it. (An MV3 extension can see that a request happened
+but not read its response.) It never polls, and it debounces the burst of
+usage calls a page load makes into one fetch. Leave it out if you'd rather
+nothing send requests on your behalf.
 
 The endpoint only takes JSON from a `chrome-extension://` origin, up to 256 KB,
 and sends no CORS headers, so an ordinary web page can't write to it. It
