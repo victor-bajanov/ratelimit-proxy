@@ -362,11 +362,3 @@ and at the ceiling `accept()` fails and every `api.anthropic.com` client on
 the machine hangs. `serve` raises the soft limit to 10240 at startup — forty
 times anything observed, and low enough that a real leak crashes this process
 (launchd restarts it) rather than crowding the system table.
-
-## Provenance
-
-Grew out of a throwaway script in a Claude Code scratchpad
-(`ratelimit_proxy.py`, Sept 2026) written alongside a few other scripts while
-working out how Max 20x plan limits actually behave. Those answered "what did
-I spend"; this answers "what does Anthropic think I spent", which turned out
-to be the more useful question.
