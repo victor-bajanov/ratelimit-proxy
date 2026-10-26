@@ -2044,6 +2044,74 @@ def _listening(port: int) -> bool:
         return False
 
 
+class _Loopback(http.client.HTTPSConnection):
+    """Dials the TLS listener but speaks to it as the upstream host, SNI and
+    certificate check included: what a client sent there by /etc/hosts does."""
+
+    def connect(self):
+        sock = socket.create_connection(("127.0.0.1", self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _title(body: bytes) -> str:
+    """An error page's <title>, else the start of the body, for one line."""
+    text = body.decode("utf-8", "replace")
+    match = re.search(r"<title>(.*?)</title>", text, re.I | re.S)
+    text = " ".join((match.group(1) if match else text).split())
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def roundtrip(port: int, timeout: float = 15) -> tuple[bool, str]:
+    """One request through the TLS listener as a client would send it, minus
+    credentials, so the API refuses it with a 401 and nothing is spent.
+
+    Anything but that 401 means a client would be failing too, and the reply
+    says where: a page from Cloudflare that never reached the API, the
+    proxy's own 502 when it could not get out, or the API erroring for real.
+    """
+    started = time.monotonic()
+    conn = _Loopback(UPSTREAM_HOST, port, timeout=timeout,
+                     context=ssl.create_default_context(cafile=str(CA_CERT)))
+    try:
+        conn.request("POST", "/v1/messages", body=b"{}", headers={
+            "Host": UPSTREAM_HOST,  # not host:port, off :443 as under test
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "User-Agent": "claude-ratelimit-proxy/status"})
+        response = conn.getresponse()
+        body = response.read()
+    except ssl.SSLCertVerificationError as exc:
+        return False, f"certificate rejected, as a client would: {exc.verify_message}"
+    except ConnectionRefusedError:
+        return False, f"connection refused on 127.0.0.1:{port}"
+    except TimeoutError:
+        return False, f"no reply within {timeout:g}s"
+    except (OSError, http.client.HTTPException) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        _close(conn)
+    ms = int((time.monotonic() - started) * 1000)
+
+    try:
+        error = json.loads(body)["error"]
+        kind, message = error["type"], error.get("message", "")
+    except Exception:
+        kind = None
+    if response.status == 401 and kind == "authentication_error":
+        return True, (f"ok, API answered 401 authentication_error in {ms} ms "
+                      f"({response.getheader('request-id')})")
+    if kind:
+        return False, f"API answered {response.status} {kind}: {message}"
+    ray = response.getheader("cf-ray")
+    if ray or (response.getheader("Server") or "").lower() == "cloudflare":
+        return False, (f"Cloudflare {response.status} page, not the API: "
+                       f"{_title(body)!r} (cf-ray {ray})")
+    # Proxy.send_error puts its message in the reason phrase; the page is
+    # a generic template.
+    return False, (f"the proxy answered {response.status} {response.reason} "
+                   f"itself, nothing came back from upstream")
+
+
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
@@ -2102,6 +2170,9 @@ def status(args):
 
     listening = _listening(args.tls_port)
     print(f"tls     : {'listening' if listening else 'NOT LISTENING'} on :{args.tls_port}")
+    if listening:
+        ok, line = roundtrip(args.tls_port)
+        print(f"trip    : {line if ok else 'FAILED: ' + line}")
 
     env = os.environ.get("ANTHROPIC_BASE_URL")
     if env:

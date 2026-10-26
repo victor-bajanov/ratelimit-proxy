@@ -1879,3 +1879,170 @@ def test_the_ca_cannot_vouch_for_any_other_site(cert_dir):
     result = _verify(cert_dir / "ca.pem", forged)
     assert result.returncode != 0
     assert "permitted subtree violation" in result.stdout + result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# status: the client-eye roundtrip
+# --------------------------------------------------------------------------- #
+
+API_401 = (b'{"type":"error","error":{"type":"authentication_error",'
+           b'"message":"x-api-key header is required"},"request_id":"req_1"}')
+CF_522 = (b"<!DOCTYPE html><html><head><title>api.anthropic.com | 522: "
+          b"Connection timed out</title></head><body>...</body></html>")
+
+
+def _reply(status: int, body: bytes, reason: str = "X", **headers: str) -> bytes:
+    head = [f"HTTP/1.1 {status} {reason}", f"Content-Length: {len(body)}",
+            "Connection: close"]
+    head += [f"{name.replace('_', '-')}: {value}" for name, value in headers.items()]
+    return ("\r\n".join(head) + "\r\n\r\n").encode() + body
+
+
+def _canned_tls(cert_dir, reply: bytes | None, seen: list | None = None) -> int:
+    """A one-shot TLS server with the proxy's own leaf, as the client meets
+    it. Records the request it got in `seen`; `reply=None` never answers."""
+    import socket
+
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert_dir / "leaf.pem", cert_dir / "leaf.key")
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+
+    def run():
+        conn, _ = sock.accept()
+        try:
+            conn = tls.wrap_socket(conn, server_side=True)
+        except ssl.SSLError:
+            return  # the client refused the certificate
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(65536)
+            head, _, rest = data.partition(b"\r\n\r\n")
+            length = next((int(line.split(b":")[1]) for line in head.split(b"\r\n")
+                           if line.lower().startswith(b"content-length:")), 0)
+            while len(rest) < length:
+                rest += conn.recv(65536)
+            if seen is not None:
+                seen.append((head.decode(), rest))
+            if reply is None:
+                time.sleep(3)
+                return
+            conn.sendall(reply)
+
+    threading.Thread(target=run, daemon=True).start()
+    return sock.getsockname()[1]
+
+
+def test_roundtrip_passes_on_the_apis_own_401(cert_dir):
+    seen = []
+    port = _canned_tls(cert_dir, _reply(401, API_401, request_id="req_1",
+                                        cf_ray="abc-SYD", server="cloudflare"), seen)
+    ok, line = proxy.roundtrip(port)
+    assert ok, line
+    assert "401 authentication_error" in line and "req_1" in line
+    assert "ms" in line
+
+
+def test_roundtrip_speaks_as_a_client_without_credentials(cert_dir):
+    seen = []
+    port = _canned_tls(cert_dir, _reply(401, API_401), seen)
+    proxy.roundtrip(port)
+    head, body = seen[0]
+    request_line, *lines = head.split("\r\n")
+    assert request_line == "POST /v1/messages HTTP/1.1"
+    names = {line.split(":")[0].lower(): line.split(":", 1)[1].strip() for line in lines}
+    assert names["host"] == proxy.UPSTREAM_HOST
+    assert "anthropic-version" in names
+    assert not any(proxy.SECRET.search(name) for name in names)
+    assert json.loads(body) == {}
+
+
+def test_roundtrip_names_a_cloudflare_error_page(cert_dir):
+    port = _canned_tls(cert_dir, _reply(522, CF_522, cf_ray="abc-SYD",
+                                        server="cloudflare",
+                                        content_type="text/html"))
+    ok, line = proxy.roundtrip(port)
+    assert not ok
+    assert "Cloudflare" in line and "522" in line
+    assert "Connection timed out" in line
+    assert "abc-SYD" in line
+
+
+def test_roundtrip_names_a_cloudflare_challenge(cert_dir):
+    page = b"<html><head><title>Just a moment...</title></head></html>"
+    port = _canned_tls(cert_dir, _reply(403, page, cf_ray="abc-SYD",
+                                        server="cloudflare"))
+    ok, line = proxy.roundtrip(port)
+    assert not ok
+    assert "Cloudflare" in line and "403" in line and "Just a moment..." in line
+
+
+def test_roundtrip_reports_an_api_error_that_is_not_auth(cert_dir):
+    body = b'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+    port = _canned_tls(cert_dir, _reply(529, body, request_id="req_2",
+                                        cf_ray="abc-SYD"))
+    ok, line = proxy.roundtrip(port)
+    assert not ok
+    assert "529 overloaded_error" in line and "Overloaded" in line
+
+
+def test_roundtrip_blames_the_proxy_for_its_own_502(cert_dir):
+    # What Proxy.send_error(502) says when upstream is unreachable: no
+    # Cloudflare headers, because nothing got as far as Cloudflare, and the
+    # message in the reason phrase; the page itself is a generic template.
+    page = b"<html><head><title>Error response</title></head></html>"
+    port = _canned_tls(cert_dir, _reply(502, page, reason="upstream unreachable",
+                                        server="BaseHTTP/0.6 Python/3.13"))
+    ok, line = proxy.roundtrip(port)
+    assert not ok
+    assert "proxy" in line and "502" in line and "upstream unreachable" in line
+
+
+def test_roundtrip_reports_nothing_listening(cert_dir):
+    import socket
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    ok, line = proxy.roundtrip(port)
+    assert not ok
+    assert "refused" in line
+
+
+def test_roundtrip_reports_a_certificate_the_client_would_reject(cert_dir, tmp_path,
+                                                                 monkeypatch):
+    port = _canned_tls(cert_dir, _reply(401, API_401))
+    other = tmp_path / "other.pem"
+    subprocess.run([proxy.OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(tmp_path / "other.key"), "-out", str(other),
+                    "-subj", "/CN=other", "-days", "1"], check=True, capture_output=True)
+    monkeypatch.setattr(proxy, "CA_CERT", other)
+    ok, line = proxy.roundtrip(port)
+    assert not ok
+    assert "certificate" in line.lower()
+
+
+def test_roundtrip_gives_up_on_a_silent_server(cert_dir):
+    port = _canned_tls(cert_dir, None)
+    ok, line = proxy.roundtrip(port, timeout=0.5)
+    assert not ok
+    assert "no reply" in line
+
+
+def test_status_prints_the_roundtrip_when_tls_is_listening(tmp_path, monkeypatch,
+                                                           capsys):
+    _quiet_status(monkeypatch)
+    monkeypatch.setattr(proxy, "_listening", lambda port: True)
+    monkeypatch.setattr(proxy, "roundtrip",
+                        lambda port: (False, "Cloudflare 522 page, not the API"))
+    proxy.status(SimpleNamespace(port=1, tls_port=1, db=tmp_path / "t.db"))
+    assert "trip    : FAILED: Cloudflare 522 page, not the API" in capsys.readouterr().out
+
+
+def test_status_skips_the_roundtrip_when_tls_is_down(tmp_path, monkeypatch, capsys):
+    _quiet_status(monkeypatch)
+    monkeypatch.setattr(proxy, "roundtrip", lambda port: pytest.fail("tried anyway"))
+    proxy.status(SimpleNamespace(port=1, tls_port=1, db=tmp_path / "t.db"))
+    assert "trip" not in capsys.readouterr().out
