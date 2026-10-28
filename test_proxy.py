@@ -752,9 +752,10 @@ def test_open_fds_counts_a_new_descriptor(tmp_path):
 
 
 @pytest.mark.parametrize("model, per_mtok_in, per_mtok_out", [
-    # $4 / $20 list, metered at 0.58x: fitted 16 Oct 2026 against Mythos
-    # (full list) on the same meters, and against the Fable-scoped meter.
-    ("claude-opus-5-5", 309_334, 1_546_667),
+    # $4 / $20 list, metered at 0.60x: fitted against Mythos (full list) on
+    # the same meters and the Fable-scoped meter, then against the first
+    # Max 5x week run to the cap (28 Oct 2026), which read 0.61x.
+    ("claude-opus-5-5", 320_000, 1_600_000),
     ("claude-sonnet-5-5", 266_667, 1_333_334),  # $2 / $10
     ("claude-mythos-5-1", 1_333_334, 6_666_667),  # $10 / $50, as Fable
 ])
@@ -789,7 +790,7 @@ def test_credits_between_counts_cache_reads_toward_the_long_prompt_tier(tmp_path
 
 
 def test_credits_ignores_cache_reads_for_untiered_models():
-    assert proxy.credits("claude-opus-5-5", 1_000_000, 0, 0, cache_read=5_000_000) == 309_334
+    assert proxy.credits("claude-opus-5-5", 1_000_000, 0, 0, cache_read=5_000_000) == 320_000
 
 
 if __name__ == "__main__":
@@ -838,6 +839,47 @@ def test_shifts_judge_each_jump_against_the_cap_in_force_then(tmp_path, day, fla
         found, examined = proxy._shifts(conn)
     assert examined == 1
     assert bool(found) is flagged
+
+
+def _shift_rows(conn, t0, readings):
+    for dt, util in readings:
+        conn.execute("INSERT INTO ratelimit (ts, seven_d_utilization, seven_d_reset) "
+                     "VALUES (?, ?, ?)", (t0 + dt, util, t0 + 86400))
+
+
+def test_shifts_ignore_stale_headers_from_concurrent_responses(tmp_path):
+    """A long response finishing late carries the level from when it started.
+
+    Seen 27 Oct 2026: 84 -> 81 -> 84 within one second, flagged twice.
+    """
+    t0 = _local_ts(2026, 10, 27)
+    with proxy.connect(tmp_path / "s.db") as conn:
+        _shift_rows(conn, t0, ((0, 0.84), (1, 0.81), (2, 0.84), (3, 0.85)))
+        found, examined = proxy._shifts(conn)
+    assert found == []
+    assert examined == 2  # 0.84 -> 0.84 -> 0.85; the stale 0.81 is skipped
+
+
+def test_shifts_restart_at_a_plan_switch_which_zeroes_the_meter(tmp_path):
+    """The 18 Oct 2026 switch to Max 5x zeroed the 7d meter but kept the
+    reset time, so the readings after it are not stale against those before."""
+    t0 = _local_ts(2026, 10, 16)
+    t1 = _local_ts(2026, 10, 19)
+    with proxy.connect(tmp_path / "s.db") as conn:
+        for ts, util in ((t0, 0.40), (t1, 0.10), (t1 + 3600, 0.20)):
+            conn.execute("INSERT INTO ratelimit (ts, seven_d_utilization, seven_d_reset) "
+                         "VALUES (?, ?, ?)", (ts, util, t1 + 86400))
+        found, examined = proxy._shifts(conn)
+    assert examined == 1
+    assert [(f[2], f[3]) for f in found] == [(0.10, 0.20)]
+
+
+def test_shifts_still_flag_a_jump_that_follows_a_stale_header(tmp_path):
+    t0 = _local_ts(2026, 10, 27)
+    with proxy.connect(tmp_path / "s.db") as conn:
+        _shift_rows(conn, t0, ((0, 0.50), (1, 0.47), (3600, 0.70)))
+        found, _ = proxy._shifts(conn)
+    assert [(f[2], f[3]) for f in found] == [(0.50, 0.70)]
 
 
 # --------------------------------------------------------------------------- #

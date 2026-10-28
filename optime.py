@@ -14,7 +14,8 @@ ticks is one observation.
 For each meter (5h, 7d, 7d-opus) the algorithm is:
 
   1. Take every signal row carrying that meter, ordered by time, and split
-     into windows on the meter's reset timestamp.
+     into windows on the meter's reset timestamp, and on a plan switch,
+     which zeroes the meter without moving the reset.
   2. Inside a window the meter can only rise, so the *first* sighting of each
      new running-max level is a tick boundary. Later rows showing a lower
      value are stale headers from long-running concurrent responses (the
@@ -72,7 +73,8 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 
-from proxy import DB_PATH, LIST_PRICE, LONG_PROMPT_PRICE, PRICE, connect, credits
+from proxy import (DB_PATH, LIST_PRICE, LONG_PROMPT_PRICE, PRICE, connect, credits,
+                   plan_at)
 
 # meter key -> (utilisation column, reset column, label)
 METERS = {
@@ -166,19 +168,21 @@ def boundaries(rows):
     """Per window, the first sighting of each new running-max level.
 
     Rows are (ts, util, reset) sorted by header-generation time. Returns
-    [(reset, [(ts, level)])] in first-seen window order.
+    [(reset, [(ts, level)])] in first-seen window order. A plan switch starts
+    a window too: it zeroes the meter without moving the reset.
     """
     windows: dict = {}
     order = []
     for ts, util, reset in rows:
         level = round(util * 100)
-        if reset not in windows:
-            windows[reset] = []
-            order.append(reset)
-        seen = windows[reset]
+        key = (reset, plan_at(ts))
+        if key not in windows:
+            windows[key] = []
+            order.append(key)
+        seen = windows[key]
         if not seen or level > seen[-1][1]:
             seen.append((ts, level))
-    return [(reset, windows[reset]) for reset in order]
+    return [(key[0], windows[key]) for key in order]
 
 
 class Requests:

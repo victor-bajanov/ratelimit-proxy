@@ -17,7 +17,7 @@ import proxy
 
 def test_list_price_keeps_opus_5_5_at_list_while_credits_use_the_plan_rate():
     assert proxy.LIST_PRICE["claude-opus-5-5"] == (4, 20)
-    assert proxy.PRICE["claude-opus-5-5"] == (2.32, 11.6)
+    assert proxy.PRICE["claude-opus-5-5"] == (2.4, 12)
     assert proxy.LIST_PRICE.keys() == proxy.PRICE.keys()
 
 
@@ -66,6 +66,20 @@ def test_fill_accumulates_list_dollars_per_counter(tmp_path):
     requests.fill(iv)
     assert iv.dollars == pytest.approx([4, 5, 2, 10])
     assert iv.list_total("output") == pytest.approx(5)
+
+
+def test_boundaries_start_a_new_window_at_a_plan_switch():
+    """The 18 Oct 2026 switch to Max 5x zeroed the 7d meter but kept the
+    reset time; the levels after it must not read as stale."""
+    from datetime import datetime
+    before = int(datetime(2026, 10, 16, 12).timestamp())
+    after = int(datetime(2026, 10, 19, 12).timestamp())
+    reset = after + 86400
+    rows = [(before, 0.40, reset), (after, 0.10, reset), (after + 60, 0.11, reset)]
+    assert optime.boundaries(rows) == [
+        (reset, [(before, 40)]),
+        (reset, [(after, 10), (after + 60, 11)]),
+    ]
 
 
 def _iv(dollars):

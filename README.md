@@ -177,7 +177,7 @@ output. Two more fits are printed alongside:
   at the output price, Haiku 5.5's long-prompt tier applied per request). The
   betas are ticks per list dollar, so a Fable hour and a Haiku hour share one
   set of coefficients. Models the plan meters off list (Opus 5.5 at about
-  0.58x) bias it; `--by-model` measures each model on its own.
+  0.60x) bias it; `--by-model` measures each model on its own.
 * a single-coefficient fit on `credits()`, as a sanity check against the
   plan pricing table.
 

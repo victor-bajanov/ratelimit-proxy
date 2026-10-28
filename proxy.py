@@ -136,10 +136,11 @@ LIST_PRICE = {"claude-fable-5": (10, 50), "claude-fable-5-1": (10, 50),
               "claude-sonnet-4-6": (3, 15), "claude-haiku-4-5-20251001": (1, 5),
               "claude-haiku-4-5": (1, 5), "claude-haiku-5-5": (0.1, 0.5)}
 # Credits per Mtok, mirroring sched.py: list price, except Opus 5.5, metered
-# at about 0.58x list, fitted 16 Oct 2026 against Mythos 5.1 (full list, like
-# Fable) on the same meters and against the Fable-scoped meter, which is half
-# the weekly cap.
-PRICE = {**LIST_PRICE, "claude-opus-5-5": (2.32, 11.6)}
+# at 0.60x list. Fitted at 0.58x on 16 Oct 2026 against Mythos 5.1 (full list,
+# like Fable) on the same meters and against the Fable-scoped meter, which is
+# half the weekly cap; the first Max 5x week run to the cap (28 Oct) read
+# 0.61x. 0.60 is the round figure both sit beside.
+PRICE = {**LIST_PRICE, "claude-opus-5-5": (2.4, 12)}
 # Models priced higher once the prompt (input + cache writes + cache reads)
 # passes a size: model -> (prompt tokens, $/Mtok in, $/Mtok out).
 LONG_PROMPT_PRICE = {"claude-haiku-5-5": (100_000, 0.5, 2.5)}
@@ -2533,15 +2534,25 @@ def _shifts(conn, cap: float | None = None, since: int = 0):
         "WHERE seven_d_utilization IS NOT NULL AND ts >= ? ORDER BY ts",
         (since,)).fetchall()
     found, examined = [], 0
-    for prev, row in zip(rows, rows[1:]):
-        if row["r"] != prev["r"] or not prev["u"] or not row["u"]:
-            continue  # the window rolled over; utilisation legitimately drops
+    prev = None
+    for row in rows:
+        if (prev is None or row["r"] != prev["r"] or not prev["u"]
+                or plan_at(row["ts"]) != plan_at(prev["ts"])):
+            # The window rolled over, or a plan switch zeroed the meter without
+            # moving the reset; utilisation legitimately drops.
+            prev = row
+            continue
+        if not row["u"] or row["u"] < prev["u"]:
+            # A long response finishing late carries the level from when it
+            # started; inside a window the meter only rises.
+            continue
         examined += 1
         spent = _credits_between(conn, prev["ts"], row["ts"])
         # 0.01 of quantisation on each reading, plus whatever traffic explains.
         explained = spent / VISIBLE_SHARE / (cap or weekly_cap(row["ts"])) + 0.02
-        if abs(row["u"] - prev["u"]) > explained:
+        if row["u"] - prev["u"] > explained:
             found.append((prev["ts"], row["ts"], prev["u"], row["u"], spent))
+        prev = row
     return found, examined
 
 
