@@ -1442,6 +1442,61 @@ def _force_long_context(body: bytes) -> bytes:
 # Proxy
 # --------------------------------------------------------------------------- #
 
+class Rates:
+    """Requests and tokens over a trailing window, in memory, for
+    GET /__proxy/rates.
+
+    A request counts as started when it reaches the relay and finished when
+    the proxy is done with it, whatever the outcome. Its tokens land when it
+    finishes, since that is when the usage block arrives: a three-minute
+    stream adds all its output in the second it ends."""
+
+    TOKENS = ("input", "output", "cache_write", "cache_read")
+
+    def __init__(self, window: float = 60, clock=time.monotonic):
+        self.window = window
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._started: collections.deque = collections.deque()
+        self._finished: collections.deque = collections.deque()  # (ts, usage)
+        self._in_flight = 0
+
+    def start(self):
+        with self._lock:
+            self._started.append(self._clock())
+            self._in_flight += 1
+
+    def finish(self, usage: tuple | None):
+        """usage is (model, input, output, cache_write, cache_read), or None
+        for a request that never got that far."""
+        with self._lock:
+            self._finished.append((self._clock(), usage))
+            self._in_flight -= 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            cutoff = self._clock() - self.window
+            while self._started and self._started[0] <= cutoff:
+                self._started.popleft()
+            while self._finished and self._finished[0][0] <= cutoff:
+                self._finished.popleft()
+            started, finished = len(self._started), len(self._finished)
+            usages = [u for _, u in self._finished if u]
+            in_flight = self._in_flight
+        tokens = {name: sum(u[i + 1] for u in usages)
+                  for i, name in enumerate(self.TOKENS)}
+        tokens["credits"] = sum(credits(*u) for u in usages if u[0])
+        return {
+            "window_s": self.window,
+            "in_flight": in_flight,
+            "requests": {"started": started, "finished": finished},
+            "rps": {"started": started / self.window,
+                    "finished": finished / self.window},
+            "tokens": tokens,
+            "tps": {name: n / self.window for name, n in tokens.items()},
+        }
+
+
 class Proxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 900
@@ -1451,6 +1506,7 @@ class Proxy(BaseHTTPRequestHandler):
     config: Config
     started_at: float
     counters: dict
+    rates: Rates
     verbose: bool
     # Whether this listener takes the usage extension's POSTs. Only the plain
     # one does: the browser reaches it by address, and TLS is for the API.
@@ -1465,8 +1521,16 @@ class Proxy(BaseHTTPRequestHandler):
 
     # -- helpers ----------------------------------------------------------- #
 
+    def _json(self, payload: dict):
+        body = json.dumps(payload, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _health(self):
-        body = json.dumps({
+        self._json({
             "ok": True,
             "pid": os.getpid(),
             "uptime_s": round(time.monotonic() - self.started_at, 1),
@@ -1482,12 +1546,7 @@ class Proxy(BaseHTTPRequestHandler):
             "fds": open_fds(),
             "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0],
             "prompt_log": self._prompt_log(),
-        }, indent=2).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        })
 
     def _prompt_log(self) -> dict | None:
         """config.json's prompt rules as this process holds them, which is
@@ -1584,12 +1643,22 @@ class Proxy(BaseHTTPRequestHandler):
         if self.path.startswith("/__proxy/"):
             if self.path == "/__proxy/health":
                 self._health()
+            elif self.path == "/__proxy/rates":
+                self._json(self.rates.snapshot())
             elif self.path == "/__proxy/claude-usage" and self.ingests_usage:
                 self._ingest_usage()
             else:
                 self.send_error(404)
             return
 
+        self.rates.start()
+        self._usage = None  # _record fills it in, if the reply had any
+        try:
+            self._proxy()
+        finally:
+            self.rates.finish(self._usage)
+
+    def _proxy(self):
         started = time.monotonic()
         self.counters["requests"] += 1
 
@@ -1731,6 +1800,8 @@ class Proxy(BaseHTTPRequestHandler):
         self._log_prompt(body, request_id)
 
         sniffer.finish()
+        self._usage = (sniffer.model, sniffer.input_tokens, sniffer.output_tokens,
+                       sniffer.cache_creation, sniffer.cache_read)
         if sniffer.model or request_id:
             self.recorder.request({
                 "ts": int(time.time()),
@@ -1859,6 +1930,7 @@ def serve(args):
     Proxy.upstream = Upstream(UPSTREAM_HOST, timeout=args.timeout, resolver=resolver)
     Proxy.started_at = time.monotonic()
     Proxy.counters = {"requests": 0, "errors": 0}
+    Proxy.rates = Rates()
     Proxy.verbose = args.verbose
 
     plain = Server(("127.0.0.1", args.port), Proxy)

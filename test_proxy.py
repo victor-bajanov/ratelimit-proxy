@@ -32,6 +32,7 @@ def handler_env(tmp_path):
         stats={"pool_dropped": 0, "pool_stale_timeout": 0})
     proxy.Proxy.started_at = time.monotonic()
     proxy.Proxy.counters = {"requests": 0, "errors": 0}
+    proxy.Proxy.rates = proxy.Rates()
     proxy.Proxy.verbose = False
 
 
@@ -1102,6 +1103,97 @@ def prompt_env(plain_server, config_now, tmp_path, monkeypatch):
                           recorder=proxy.Proxy.recorder, relayed=relayed)
     upstream.server.shutdown()
     upstream.server.server_close()
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def test_rates_count_starts_and_finishes_over_the_window():
+    clock = _Clock()
+    rates = proxy.Rates(window=60, clock=clock)
+    for _ in range(3):
+        rates.start()
+    rates.finish(("claude-sonnet-5", 10, 20, 30, 40))
+    rates.finish(None)  # a request that never got as far as a usage block
+    snap = rates.snapshot()
+    assert snap["window_s"] == 60
+    assert snap["in_flight"] == 1
+    assert snap["requests"] == {"started": 3, "finished": 2}
+    assert snap["rps"] == {"started": 3 / 60, "finished": 2 / 60}
+    assert snap["tokens"] == {
+        "input": 10, "output": 20, "cache_write": 30, "cache_read": 40,
+        "credits": proxy.credits("claude-sonnet-5", 10, 20, 30, 40)}
+    assert snap["tps"]["output"] == 20 / 60
+    assert snap["tps"]["credits"] == snap["tokens"]["credits"] / 60
+
+
+def test_rates_forget_what_fell_out_of_the_window():
+    clock = _Clock()
+    rates = proxy.Rates(window=60, clock=clock)
+    rates.start()
+    rates.finish(("claude-sonnet-5", 1, 100, 0, 0))
+    clock.now += 30
+    rates.start()
+    clock.now += 31  # the first pair is now 61 s old, the second start 31 s
+    snap = rates.snapshot()
+    assert snap["requests"] == {"started": 1, "finished": 0}
+    assert snap["tokens"]["output"] == 0
+    assert snap["in_flight"] == 1  # in flight is a level, not a windowed count
+
+
+def test_rates_endpoint_reports_proxied_traffic(prompt_env):
+    _send(prompt_env, _message())
+    _send(prompt_env, _message())
+    conn = http.client.HTTPConnection("127.0.0.1", prompt_env.port, timeout=5)
+    conn.request("GET", "/__proxy/rates")
+    response = conn.getresponse()
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "application/json"
+    body = json.load(response)
+    conn.close()
+    # The fake upstream answers 3 in, 9 out, 70000 cache read, every time.
+    assert body["requests"] == {"started": 2, "finished": 2}
+    assert body["in_flight"] == 0
+    assert body["tokens"]["output"] == 18
+    assert body["tokens"]["cache_read"] == 140_000
+    assert body["tokens"]["credits"] == 2 * proxy.credits("claude-sonnet-5", 3, 9, 0, 70000)
+
+
+def test_rates_endpoint_does_not_count_itself(plain_server):
+    port = plain_server.server_address[1]
+    for _ in range(2):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/__proxy/rates")
+        body = json.load(conn.getresponse())
+        conn.close()
+    assert body["requests"] == {"started": 0, "finished": 0}
+
+
+def test_rates_endpoint_is_served_on_the_tls_listener(tls_server):
+    port = tls_server.server_address[1]
+    conn = http.client.HTTPSConnection("::1", port, context=_client_ctx(), timeout=5)
+    conn.request("GET", "/__proxy/rates")
+    response = conn.getresponse()
+    assert response.status == 200
+    assert json.load(response)["window_s"] == 60
+    conn.close()
+
+
+def test_a_request_upstream_refuses_is_no_longer_in_flight(plain_server):
+    def refuse(*args):
+        raise ConnectionRefusedError("nope")
+
+    proxy.Proxy.upstream = SimpleNamespace(send=refuse, stats=proxy.Proxy.upstream.stats)
+    response = _post(plain_server.server_address[1], _message())
+    assert response.status == 502
+    snap = proxy.Proxy.rates.snapshot()
+    assert snap["in_flight"] == 0
+    assert snap["requests"] == {"started": 1, "finished": 1}
 
 
 def _message(model="claude-sonnet-5", **extra) -> bytes:

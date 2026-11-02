@@ -136,6 +136,13 @@ latest signal (Sat 12 Sep 13:58), status allowed_warning:
   7d        77.0%  [###############################.........]  resets Wed 16 Sep 01:00
 ```
 
+For live traffic, `curl -s localhost:8787/__proxy/rates` gives requests and
+tokens over the last 60 seconds, held in memory: requests started, finished
+and in flight, tokens by kind (input, output, cache write, cache read) plus
+credits, and each as a per-second rate. Tokens count when a request finishes,
+because that is when the usage block arrives, so a long stream adds all its
+output in the second it ends.
+
 ## Operational time: what does a token cost?
 
 ```
