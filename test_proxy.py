@@ -821,6 +821,8 @@ def _local_ts(y, mo, d, h=12) -> int:
     ((2026, 10, 1), 104_166_666),  # Max 20x, permanent +25% from 14 Sep
     ((2026, 10, 17), 104_166_666),
     ((2026, 10, 19), 52_083_375),  # Max 5x from 18 Oct
+    ((2026, 11, 3, 17), 52_083_375),
+    ((2026, 11, 3, 18), 104_166_666),  # back to Max 20x at 17:28:52 AEDT 3 Nov
 ])
 def test_weekly_cap_follows_the_plan_and_promotion_in_force(when, cap):
     assert proxy.weekly_cap(_local_ts(*when)) == pytest.approx(cap, abs=1)

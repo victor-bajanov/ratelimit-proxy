@@ -2552,6 +2552,9 @@ PLANS = (
      "Max 20x", 83_333_333, 1.25),
     (int(datetime(2026, 10, 17, 13, tzinfo=timezone.utc).timestamp()),  # 18 Oct AEDT
      "Max 5x", 41_666_700, 1.25),
+    # 17:28:52 AEDT 3 Nov, first zeroed header; 5h restarted, 7d reset unmoved.
+    (int(datetime(2026, 11, 3, 6, 28, 52, tzinfo=timezone.utc).timestamp()),
+     "Max 20x", 83_333_333, 1.25),
 )
 
 
