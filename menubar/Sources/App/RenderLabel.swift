@@ -13,8 +13,7 @@ enum RenderLabel {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let now = Date()
             for (name, store) in syntheticStores(now: now) {
-                let image = LabelRenderer.image(store: store, metric: .tpsCredits,
-                                                pollInterval: 5, now: now)
+                let image = LabelRenderer.image(store: store, metric: .tpsCredits, now: now)
                 try png(image, scale: 2).write(to: dir.appendingPathComponent("label-\(name).png"))
             }
         } catch {

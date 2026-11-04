@@ -9,8 +9,8 @@ enum Sparkline {
     static let window: TimeInterval = 300
 
     static func geometry(_ points: [ChartPoint], from: Date, to: Date,
-                         width: Double = 40, height: Double = 16,
-                         inset: Double = 1) -> [[SparkPoint]] {
+                         width: Double = Sparkline.width, height: Double = Sparkline.height,
+                         inset: Double = Sparkline.inset) -> [[SparkPoint]] {
         let span = to.timeIntervalSince(from)
         guard span > 0 else { return [] }
         let visible = points.filter { $0.time >= from && $0.time <= to }

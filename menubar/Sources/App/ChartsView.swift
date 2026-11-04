@@ -6,7 +6,6 @@ struct GroupChart: View {
     let group: MetricGroup
     let store: SampleStore
     let range: ChartRange
-    let pollInterval: Int
     let now: Date
 
     static func color(_ m: Metric) -> Color {
@@ -21,8 +20,7 @@ struct GroupChart: View {
 
     var body: some View {
         let from = now.addingTimeInterval(-range.seconds)
-        let points = store.points(for: group.metrics, since: from,
-                                  breakAfter: PollInterval.breakThreshold(pollInterval))
+        let points = store.points(for: group.metrics, since: from)
         let counts = Dictionary(grouping: points, by: \.seriesKey).mapValues(\.count)
         let latest = group.metrics.compactMap { m in
             store.latestValue(m).map { ValueFormat.full($0, metric: m) }
@@ -62,7 +60,7 @@ struct GroupChart: View {
                     Text("No data").font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .frame(height: 110)
+            .frame(height: group == .inFlight ? 60 : 110)
         }
     }
 }

@@ -33,8 +33,7 @@ struct PanelView: View {
             .pickerStyle(.menu)
 
             ForEach(MetricGroup.allCases) { group in
-                GroupChart(group: group, store: poller.store, range: range,
-                           pollInterval: poller.settings.pollInterval, now: now)
+                GroupChart(group: group, store: poller.store, range: range, now: now)
             }
 
             if showSettings {

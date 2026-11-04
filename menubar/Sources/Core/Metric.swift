@@ -2,13 +2,14 @@ import Foundation
 
 /// A chart panel: metrics that share an axis.
 enum MetricGroup: String, CaseIterable, Sendable, Identifiable {
-    case requests, tokens, cacheRead, credits
+    case requests, inFlight, tokens, cacheRead, credits
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .requests: "Requests"
+        case .requests: "Requests/s"
+        case .inFlight: "In flight"
         case .tokens: "Tokens/s"
         case .cacheRead: "Cache read tokens/s"
         case .credits: "Credits/s"
@@ -17,7 +18,8 @@ enum MetricGroup: String, CaseIterable, Sendable, Identifiable {
 
     var metrics: [Metric] {
         switch self {
-        case .requests: [.rpsStarted, .rpsFinished, .inFlight]
+        case .requests: [.rpsStarted, .rpsFinished]
+        case .inFlight: [.inFlight]
         case .tokens: [.tpsInput, .tpsOutput, .tpsCacheWrite]
         case .cacheRead: [.tpsCacheRead]
         case .credits: [.tpsCredits]
@@ -82,7 +84,8 @@ enum Metric: String, CaseIterable, Sendable, Identifiable {
 
     var group: MetricGroup {
         switch self {
-        case .inFlight, .rpsStarted, .rpsFinished: .requests
+        case .inFlight: .inFlight
+        case .rpsStarted, .rpsFinished: .requests
         case .tpsInput, .tpsOutput, .tpsCacheWrite: .tokens
         case .tpsCacheRead: .cacheRead
         case .tpsCredits: .credits

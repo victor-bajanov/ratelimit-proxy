@@ -9,7 +9,6 @@ struct MenuBarLabel: View {
         Image(nsImage: LabelRenderer.image(
             store: poller.store,
             metric: poller.settings.sparklineMetric,
-            pollInterval: poller.settings.pollInterval,
             now: Date()))
     }
 }
@@ -22,18 +21,11 @@ enum LabelRenderer {
     static let widestText = "888k/s"
 
     /// Draws the label for the store's current state as a template image.
-    static func image(store: SampleStore, metric: Metric, pollInterval: Int, now: Date) -> NSImage {
-        let status = store.status
-        let unreachable: Bool
-        let waiting: Bool
-        switch status {
-        case .waiting: unreachable = false; waiting = true
-        case .live: unreachable = false; waiting = false
-        case .unreachable: unreachable = true; waiting = false
-        }
+    static func image(store: SampleStore, metric: Metric, now: Date) -> NSImage {
+        let unreachable = store.status.isUnreachable
+        let waiting = store.status.isWaiting
         let from = now.addingTimeInterval(-Sparkline.window)
-        let points = store.points(for: [metric], since: from,
-                                  breakAfter: PollInterval.breakThreshold(pollInterval))
+        let points = store.points(for: [metric], since: from)
         let segments = Sparkline.geometry(points, from: from, to: now,
                                           width: Sparkline.width, height: height,
                                           inset: Sparkline.inset)

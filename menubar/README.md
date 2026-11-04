@@ -12,18 +12,22 @@ width, so it doesn't jump around as the number changes. Before the first poll
 it shows a dashed line and `–`. When the proxy can't be reached the line
 fades and the value reads `off`.
 
-Click it to open a panel with four charts:
+Click it to open a panel with five charts:
 
-* Requests: started/s, finished/s and in flight
+* Requests/s: started and finished
+* In flight: a small chart of its own, because a count of around 9 would
+  flatten rates of about 1/s
 * Tokens/s: input, output and cache write
 * Cache read tokens/s
 * Credits/s
 
 Each chart shows its latest values next to the title. A failed poll leaves a
-gap in the lines, as does any pause longer than three poll intervals (at
-least 10 s), so time the proxy was down shows up as a break, not as a line
+gap in the lines. Lines also break where two points are more than three poll
+intervals apart (at least 10 s), using the interval in force when the points
+were taken. So time the proxy was down shows up as a break, not as a line
 drawn across it. While the proxy is down the panel header says since when,
-the error, and the endpoint it is trying.
+the error, and the endpoint it is trying. The "since" time stays correct even
+when the outage lasts longer than the 1 h of history.
 
 ## Requirements
 
@@ -81,8 +85,11 @@ Under the gear button:
 
 * Poll every: 1, 2, 5 (default), 10 or 30 seconds
 * Endpoint: defaults to `http://127.0.0.1:8787/__proxy/rates`. Any http or
-  https URL is accepted, but plain http only works for local hosts (the app
-  allows local networking only). Changing the endpoint clears the history.
+  https URL is accepted. The app's `Info.plist` sets
+  `NSAllowsLocalNetworking`, which is meant to allow plain http to local hosts
+  such as 127.0.0.1 and localhost; use https for any remote endpoint. If App
+  Transport Security blocks a request, the panel shows "Plain http blocked
+  (use https)". Changing the endpoint clears the history.
 * Reset to defaults
 
 Settings live in the UserDefaults domain `local.ratelimit-proxy.menubar`.

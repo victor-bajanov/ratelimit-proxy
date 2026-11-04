@@ -37,11 +37,11 @@ final class Poller {
     }
 
     func apply(_ new: AppSettings) {
-        let old = settings
+        let effects = settings.changeEffects(to: new)
         settings = new
         new.save(to: .standard)
-        if new.endpoint != old.endpoint { store.removeAll() }
-        if new.endpoint != old.endpoint || new.pollInterval != old.pollInterval { start() }
+        if effects.clearHistory { store.removeAll() }
+        if effects.restartPolling { start() }
     }
 
     private func pollOnce() async {
@@ -49,38 +49,17 @@ final class Poller {
         var request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData,
                                  timeoutInterval: 3)
         request.httpMethod = "GET"
+        let outcome: PollOutcome
         do {
             let (data, response) = try await session.data(for: request)
-            guard !Task.isCancelled, endpoint == settings.endpoint else { return }
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                fail("HTTP \(http.statusCode)")
-                return
-            }
-            do {
-                store.record(try RatesSnapshot.decode(from: data), at: Date())
-                lastError = nil
-            } catch {
-                fail("Bad response")
-            }
+            outcome = PollOutcome.from(statusCode: (response as? HTTPURLResponse)?.statusCode,
+                                       data: data)
         } catch {
-            guard !Task.isCancelled, endpoint == settings.endpoint else { return }
-            fail(Self.describe(error))
+            outcome = .failure(PollOutcome.describe(error))
         }
-    }
-
-    private func fail(_ message: String) {
-        store.recordGap(at: Date())
-        lastError = message
-    }
-
-    private static func describe(_ error: Error) -> String {
-        guard let e = error as? URLError else { return "Request failed" }
-        switch e.code {
-        case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .notConnectedToInternet:
-            return "Could not connect"
-        case .timedOut: return "Timed out"
-        case .appTransportSecurityRequiresSecureConnection: return "Plain http blocked (use https)"
-        default: return "Request failed (\(e.code.rawValue))"
-        }
+        // Drop results from a cancelled loop or a superseded endpoint.
+        guard !Task.isCancelled, endpoint == settings.endpoint else { return }
+        store.record(outcome, at: Date(), pollInterval: settings.pollInterval)
+        lastError = outcome.errorMessage
     }
 }
