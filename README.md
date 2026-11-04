@@ -143,6 +143,8 @@ credits, and each as a per-second rate. Tokens count when a request finishes,
 because that is when the usage block arrives, so a long stream adds all its
 output in the second it ends.
 
+For a menu-bar view of the same numbers, see [menubar/](menubar/README.md).
+
 ## Operational time: what does a token cost?
 
 ```
