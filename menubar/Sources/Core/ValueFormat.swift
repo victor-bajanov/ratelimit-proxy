@@ -27,6 +27,18 @@ enum ValueFormat {
         return "\u{2013}"  // unreachable: the last tier always returns
     }
 
+    /// Chart axis ticks: k/M/B suffixes, up to three decimals, trailing zeros
+    /// trimmed, so quarter steps stay distinct (0.25, 2.5k, 1.25M).
+    static func axis(_ v: Double) -> String {
+        guard v.isFinite else { return "\u{2013}" }
+        if v < 0 { return "-" + axis(-v) }
+        let tier = tiers.last { v >= $0.divisor } ?? tiers[0]
+        var text = String(format: "%.3f", v / tier.divisor)
+        while text.hasSuffix("0") { text.removeLast() }
+        if text.hasSuffix(".") { text.removeLast() }
+        return text + tier.suffix
+    }
+
     static func full(_ v: Double, metric: Metric) -> String {
         compact(v) + " " + metric.unit
     }

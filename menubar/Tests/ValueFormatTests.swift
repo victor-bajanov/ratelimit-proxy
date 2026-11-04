@@ -25,3 +25,19 @@ func valueFormatTests() {
     expectEqual(ValueFormat.menuBar(668.8, metric: .tpsCredits, unreachable: true), "off")
     expectEqual(ValueFormat.menuBar(nil, metric: .tpsCredits, unreachable: true), "off")
 }
+
+func axisFormatTests() {
+    // Axis tick labels: k/M/B like compact, but exact enough that quarter
+    // steps (0.25, 2.5k, 1.25M) don't collapse onto their neighbours.
+    let cases: [(Double, String)] = [
+        (0, "0"), (0.25, "0.25"), (0.5, "0.5"), (0.75, "0.75"), (0.025, "0.025"),
+        (1, "1"), (1.5, "1.5"), (15, "15"), (150, "150"), (999, "999"),
+        (1000, "1k"), (2500, "2.5k"), (12_500, "12.5k"), (20_000, "20k"), (60_000, "60k"),
+        (1_250_000, "1.25M"), (8_000_000, "8M"), (2_500_000_000, "2.5B"),
+        (-2500, "-2.5k"),
+    ]
+    for (v, want) in cases {
+        expectEqual(ValueFormat.axis(v), want, "axis(\(v))")
+    }
+    expectEqual(ValueFormat.axis(.nan), "\u{2013}")
+}
