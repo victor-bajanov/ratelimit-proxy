@@ -74,8 +74,9 @@ done
 ok "label widths equal (${widths[0]})"
 
 # 5. Smoke launch against the discard port; the argument domain overrides the
-#    stored settings, so this never touches :8787 or the user's defaults.
-"$BIN" -endpointURL http://127.0.0.1:9/__proxy/rates -pollIntervalSeconds 1 >/dev/null 2>&1 &
+#    stored settings, so this never touches :8787 or the user's defaults, and
+#    -loginItemInitialised stops it registering build/ as a login item.
+"$BIN" -endpointURL http://127.0.0.1:9/__proxy/rates -pollIntervalSeconds 1 -loginItemInitialised YES >/dev/null 2>&1 &
 PID=$!
 sleep 3
 kill -0 "$PID" 2>/dev/null || fail "app still running after 3 s"

@@ -53,12 +53,19 @@ open menubar/build/ProxyRates.app
 `menubar/build/ProxyRates.app` and signs it ad hoc. The app has no Dock icon;
 quit it from the Quit button in its panel.
 
-To keep it around, copy the app to `~/Applications` and add it under System
-Settings > General > Login Items:
+To keep it around, install it to `~/Applications` and run it from there:
 
 ```sh
-cp -R menubar/build/ProxyRates.app ~/Applications/
+pkill -x ProxyRates; rm -rf ~/Applications/ProxyRates.app
+ditto menubar/build/ProxyRates.app ~/Applications/ProxyRates.app
+open ~/Applications/ProxyRates.app
 ```
+
+The first time it runs, the app registers itself to launch at login, at
+whatever path it was started from. That's why it should be run from
+`~/Applications` and not from `build/`, which every build replaces. After
+that, the "Launch at login" switch under the gear decides. To install an
+update, rerun the same three commands.
 
 ## Tests
 
@@ -90,6 +97,7 @@ Under the gear button:
   such as 127.0.0.1 and localhost; use https for any remote endpoint. If App
   Transport Security blocks a request, the panel shows "Plain http blocked
   (use https)". Changing the endpoint clears the history.
+* Launch at login: on after the first launch; turn it off here
 * Reset to defaults
 
 Settings live in the UserDefaults domain `local.ratelimit-proxy.menubar`.

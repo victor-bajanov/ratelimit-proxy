@@ -5,6 +5,7 @@ enum SettingsKey {
     static let pollInterval = "pollIntervalSeconds"    // Int
     static let endpointURL = "endpointURL"             // String
     static let chartRange = "chartRangeSeconds"        // Int
+    static let loginItemInitialised = "loginItemInitialised"  // Bool: first-launch registration done
 }
 
 enum PollInterval {

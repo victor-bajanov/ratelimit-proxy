@@ -15,6 +15,14 @@ struct SettingsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            let login = LoginItem.shared
+            Toggle("Launch at login", isOn: Binding(
+                get: { login.status.isOn },
+                set: { login.set($0) }))
+            if let note = login.error ?? login.status.note {
+                Text(note).font(.caption).foregroundStyle(.secondary)
+            }
+
             Picker("Poll every", selection: Binding(
                 get: { poller.settings.pollInterval },
                 set: { v in change { $0.pollInterval = v } })) {
