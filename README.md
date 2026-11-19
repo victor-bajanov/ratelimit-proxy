@@ -119,6 +119,19 @@ uv run proxy.py serve               # foreground, for debugging
 uv run proxy.py uninstall
 ```
 
+Cloud Claude Code sessions bill the same weekly meter but never pass through
+the proxy. `cloud_sessions.py` reads their usage from the sessions API, using
+Claude Code's own login:
+
+```
+uv run cloud_sessions.py find "Session title"     # id + record (environment_kind
+                                                  #   anthropic_cloud = cloud)
+uv run cloud_sessions.py dump SESSION_ID          # record + events to
+                                                  #   ~/.claude/ratelimit-proxy/cloud-sessions/
+uv run cloud_sessions.py tally SESSION_ID         # credits by model, split at
+                                                  #   the current week's start
+```
+
 `status` prints something like:
 
 ```
