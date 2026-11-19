@@ -130,6 +130,7 @@ RESPONSE_HOP = HOP - {"content-length"}
 # API list price, $/Mtok: (input, output).
 LIST_PRICE = {"claude-fable-5": (10, 50), "claude-fable-5-1": (10, 50),
               "claude-mythos-5-1": (10, 50),
+              "claude-fable-5-2": (8, 40), "claude-mythos-5-2": (8, 40),
               "claude-opus-5-5": (4, 20), "claude-opus-5": (5, 25),
               "claude-opus-4-8": (5, 25), "claude-opus-4-7": (5, 25),
               "claude-sonnet-5-5": (2, 10), "claude-sonnet-5": (2, 10),
@@ -200,7 +201,10 @@ CREATE TABLE IF NOT EXISTS requests (
     cache_creation_tokens INTEGER,
     cache_read_tokens     INTEGER,
     stop_reason           TEXT,
-    duration_ms           INTEGER
+    duration_ms           INTEGER,
+    thinking_tokens       INTEGER,  -- part of output_tokens; NULL when not reported
+    session_id            TEXT,     -- Claude Code's X-Claude-Code-Session-Id
+    app                   TEXT      -- its x-app: cli, or cli-bg for background calls
 );
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
 
@@ -261,7 +265,9 @@ HEADER_COLUMNS = {
 RATELIMIT_COLUMNS = (["ts"] + [c for c, _ in HEADER_COLUMNS.values()]
                      + ["extra", "request_id"])
 # Columns added after the first release, applied to older databases on open.
-MIGRATIONS = {"ratelimit": {"request_id": "TEXT"}}
+MIGRATIONS = {"ratelimit": {"request_id": "TEXT"},
+              "requests": {"thinking_tokens": "INTEGER", "session_id": "TEXT",
+                           "app": "TEXT"}}
 
 # Columns whose change makes a sample worth storing. Everything else (a reset
 # timestamp ticking over, say) rides along on the next real change.
@@ -832,6 +838,7 @@ class UsageSniffer:
         self.model: str | None = None
         self.input_tokens = self.output_tokens = 0
         self.cache_creation = self.cache_read = 0
+        self.thinking_tokens: int | None = None  # a share of output_tokens
         self.stop_reason: str | None = None
         self._pending = bytearray()
         self._whole = bytearray()
@@ -878,6 +885,10 @@ class UsageSniffer:
                                       usage.get("cache_creation_input_tokens") or 0)
             self.cache_read = max(self.cache_read,
                                   usage.get("cache_read_input_tokens") or 0)
+            details = usage.get("output_tokens_details")
+            thinking = details.get("thinking_tokens") if isinstance(details, dict) else None
+            if isinstance(thinking, int):
+                self.thinking_tokens = max(self.thinking_tokens or 0, thinking)
         stop = (payload.get("delta") or {}).get("stop_reason") if isinstance(
             payload.get("delta"), dict) else payload.get("stop_reason")
         if isinstance(stop, str):
@@ -1814,6 +1825,9 @@ class Proxy(BaseHTTPRequestHandler):
                 "cache_creation_tokens": sniffer.cache_creation,
                 "cache_read_tokens": sniffer.cache_read,
                 "stop_reason": sniffer.stop_reason,
+                "thinking_tokens": sniffer.thinking_tokens,
+                "session_id": self.headers.get("X-Claude-Code-Session-Id"),
+                "app": self.headers.get("x-app"),
                 "duration_ms": int((time.monotonic() - started) * 1000),
             })
 

@@ -759,6 +759,8 @@ def test_open_fds_counts_a_new_descriptor(tmp_path):
     ("claude-opus-5-5", 320_000, 1_600_000),
     ("claude-sonnet-5-5", 266_667, 1_333_334),  # $2 / $10
     ("claude-mythos-5-1", 1_333_334, 6_666_667),  # $10 / $50, as Fable
+    ("claude-fable-5-2", 1_066_667, 5_333_334),  # $8 / $40, cheaper than 5.1
+    ("claude-mythos-5-2", 1_066_667, 5_333_334),  # $8 / $40, as Fable 5.2
 ])
 def test_credits_prices_the_5_5_models(model, per_mtok_in, per_mtok_out):
     assert proxy.credits(model, 1_000_000, 0, 0) == per_mtok_in
@@ -1054,7 +1056,8 @@ class _MessagesUpstream:
                     "model": "claude-sonnet-5", "stop_reason": "stop_sequence",
                     "usage": {"input_tokens": 3, "output_tokens": 9,
                               "cache_creation_input_tokens": 0,
-                              "cache_read_input_tokens": 70000}}).encode()
+                              "cache_read_input_tokens": 70000,
+                              "output_tokens_details": {"thinking_tokens": 4}}}).encode()
                 # Chunked, as api.anthropic.com's Messages replies are.
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1287,6 +1290,82 @@ def test_request_headers_are_never_stored(prompt_env):
         secret = value.split("=")[-1].split()[-1].encode()
         assert secret not in stored
         assert secret not in raw
+
+
+def _requests_rows(env, columns: str) -> list[tuple]:
+    with proxy.connect(env.recorder.db_path) as conn:
+        return [tuple(r) for r in conn.execute(f"SELECT {columns} FROM requests")]
+
+
+def test_a_requests_row_keeps_the_claude_code_session_and_app(prompt_env):
+    """Claude Code names its session on every Messages call, and marks its
+    own background calls (titles, summaries) as x-app: cli-bg."""
+    _send(prompt_env, _message(), headers={
+        "X-Claude-Code-Session-Id": "11111111-2222-3333-4444-555555555555",
+        "x-app": "cli-bg"})
+    _settle(prompt_env.recorder)
+    assert _requests_rows(prompt_env, "session_id, app") == [
+        ("11111111-2222-3333-4444-555555555555", "cli-bg")]
+    assert prompt_env.recorder.last_error is None
+
+
+def test_a_request_without_session_headers_stores_nulls(prompt_env):
+    _send(prompt_env, _message())
+    _settle(prompt_env.recorder)
+    assert _requests_rows(prompt_env, "session_id, app") == [(None, None)]
+
+
+def test_connect_adds_session_columns_to_an_old_requests_table(tmp_path):
+    import sqlite3
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as conn:  # a database from before session columns
+        conn.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL)")
+    proxy.connect(db).close()
+    with sqlite3.connect(db) as conn:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
+    assert {"session_id", "app"} <= columns
+
+
+def test_a_requests_row_keeps_the_thinking_share_of_output(prompt_env):
+    _send(prompt_env, _message())
+    _settle(prompt_env.recorder)
+    with proxy.connect(prompt_env.recorder.db_path) as conn:
+        rows = conn.execute("SELECT output_tokens, thinking_tokens FROM requests").fetchall()
+    assert [tuple(r) for r in rows] == [(9, 4)]
+
+
+def test_sniffer_reads_thinking_tokens_from_the_final_message_delta():
+    sniffer = proxy.UsageSniffer()
+    sniffer.feed(b'event: message_start\ndata: {"type": "message_start", "message": '
+                 b'{"model": "claude-opus-5-5", "usage": {"input_tokens": 5, '
+                 b'"output_tokens": 1}}}\n\n')
+    sniffer.feed(b'event: message_delta\ndata: {"type": "message_delta", "delta": '
+                 b'{"stop_reason": "end_turn"}, "usage": {"output_tokens": 187, '
+                 b'"output_tokens_details": {"thinking_tokens": 20}}}\n\n')
+    sniffer.finish()
+    assert (sniffer.output_tokens, sniffer.thinking_tokens) == (187, 20)
+
+
+def test_sniffer_leaves_thinking_tokens_unknown_when_upstream_omits_them():
+    sniffer = proxy.UsageSniffer()
+    sniffer.feed(b'{"model": "claude-haiku-5-5", "usage": {"input_tokens": 3, '
+                 b'"output_tokens": 9}}')
+    sniffer.finish()
+    assert sniffer.thinking_tokens is None
+
+
+def test_connect_adds_thinking_tokens_to_an_older_requests_table(tmp_path):
+    import sqlite3
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    old.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, "
+                "request_id TEXT UNIQUE, model TEXT, output_tokens INTEGER)")
+    old.execute("INSERT INTO requests (ts, model, output_tokens) VALUES (1, 'm', 7)")
+    old.commit()
+    old.close()
+    with proxy.connect(db) as conn:
+        row = conn.execute("SELECT output_tokens, thinking_tokens FROM requests").fetchone()
+    assert tuple(row) == (7, None)
 
 
 def test_a_prompt_joins_its_requests_row(prompt_env):
